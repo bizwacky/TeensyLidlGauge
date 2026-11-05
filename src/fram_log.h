@@ -12,7 +12,7 @@
 //
 //   2. THE BLACK BOX - a circular log of one 32-byte snapshot per second-ish
 //      (all gauge fields + active warnings), the emergency backup for when
-//      the ECU's SD log is lost with the car in a hedge. ~2 hours of nominal
+//      the ECU's own log is lost with the car in a hedge. ~2 hours of nominal
 //      running fits; details and gating in fram_log.cpp, sizes/cadence in
 //      config.h, on-chip layout in docs/FRAM_BLACKBOX.md.
 //

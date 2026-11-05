@@ -6,8 +6,9 @@ It does two jobs:
 1. **Fuel record** - the calculated-fuel accumulators survive the kill
    switch. Saved every second they change, restored at boot bit-exactly.
 2. **Black box** - a circular log of one snapshot per second-ish (all gauge
-   fields + active warnings). The ECU's SD card is the primary log; this is
-   the backup that survives when the SD log is lost with the car in a hedge.
+   fields + active warnings). The ECU's own log is the primary record; this
+   is the backup that survives when that log is lost with the car in a
+   hedge.
 
 Code: `src/fram.h/.cpp` (chip driver, non-blocking write queue),
 `src/fram_log.h/.cpp` (record formats, gating, console). Constants:
@@ -99,20 +100,27 @@ next boot: one second of log, the accepted loss.
 |---|---|---|
 | seq | 4 | monotonic, never resets (except format) |
 | session | 1 | run number, bumps each boot that logs |
-| hh mm ss | 3 | RTC wall clock, 0xFF = clock not set |
-| ecuSecondsOn | 2 | **the ECU's own uptime - lines this log up with the ECU SD log** |
+| hh mm ss | 3 | RTC wall clock, 0xFF = clock not set - **the key that lines this log up with the ECU's own log** |
+| ecuLastError | 2 | rusEFI's most recent warning/error code (what the ECU itself was complaining about) |
 | rpm | 2 | as broadcast |
 | oil psi / oil C / clt C / map kPa / tps % | 5 | 1:1 (temps offset +40) |
-| afr / afr target / batt V | 3 | x10 |
+| lambda / lambda target | 2 | x100 (0 = no reading) |
+| batt V | 1 | x10 |
 | inj duty % / fuel sender % / fuel calc % | 3 | 1:1 |
 | pack A / min cell V / max cell C | 3 | 1 A signed; (V-1.0)x100; +40 |
 | alarmBits | 4 | bit n = `AlarmId` n active |
 | crc | 2 | CRC-16/CCITT |
 
 Layout version 2 (Sept 2026): `DIALFAIL` joined the alarm catalog between
-`NO CAN` and `BATTCOLD`, renumbering every `alarmBits` bit below it. A chip
-formatted by version-1 firmware reformats on first boot (fuel record + log
-lost - nothing else changed).
+`NO CAN` and `BATTCOLD`, renumbering every `alarmBits` bit below it.
+
+Layout version 3 (Nov 2026): the ECU moved from the Megasquirt broadcast to
+rusEFI's own. rusEFI broadcasts no uptime counter, so bytes 8-9 now carry
+its last error code, and the mixture bytes carry lambda x 100 instead of
+AFR x 10.
+
+A chip formatted by older firmware reformats on first boot (fuel record +
+log lost - nothing else changed).
 
 ## When the black box records
 
@@ -135,8 +143,9 @@ Open the monitor (`pio device monitor`, 115200) and press a key:
   alarm names). Runs chunked through the superloop so the gauge keeps
   working during the few-second dump; new records pause, fuel saves continue.
   Any key aborts. Copy the output into a `.csv` file and open it in any
-  spreadsheet; the `session` column splits runs, `ecu_s` aligns rows with
-  the ECU's SD log.
+  spreadsheet; the `session` column splits runs, the `time` column (RTC)
+  aligns rows with the ECU's own log, and `ecu_err` shows any warning code
+  rusEFI was raising.
 * `f` - show all 16 fuel slots (the persistence machinery, visible).
 * `X` then `Y` (within 5 s) - **format**: erases the fuel record and
   restarts the log numbering. For bench use; a layout-version bump formats

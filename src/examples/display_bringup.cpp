@@ -15,8 +15,10 @@
 //   5  CS       ->      9
 //   6  TE       ->     (unconnected for now - future tear-free sync)
 //   7  VDD      ->     3.3V
-//   8  LEDK     ->     backlight driver (demo: MOSFET gate on pin 2, PWM)
-//   9  LEDA     ->     3.3V through the backlight supply
+//   8  LEDK     ->     21R ballast -> N-FET drain; FET gate on pin 2 (PWM)
+//   9  LEDA     ->     +5V
+//                      (the gauge PCB's backlight switch - circuit drawn at
+//                       PIN_BACKLIGHT in src/config.h)
 //   10 GND      ->     GND
 //
 // What you should see, and what each element verifies:

@@ -8,10 +8,10 @@
 //
 //   * one edit remaps the dial (ROTARY_MODE_MAP in config.h),
 //   * a mode can affect several subsystems without them coordinating
-//     (Dark mode dims the LEDs AND flips the shift light to orange), and
-//   * modes with no behavior yet (DEBUG, FUEL_RESET) already occupy their
-//     detents, so adding their logic later can't reshuffle the dial the
-//     driver has learned.
+//     (Dark mode dims the LEDs AND the backlights AND flips the colors to
+//     the night scheme), and
+//   * the spare detents (MODE_UNASSIGNED) already exist, so giving them a
+//     job later can't reshuffle the dial the driver has learned.
 //
 // Deliberately stateless (no statics): the resolved mode is a pure function
 // of this tick's inputs. If the dial says Dark, the gauge is dark - nothing
@@ -62,10 +62,13 @@ void modesUpdate()
                           m.screenBrightness = SCREEN_BRIGHTNESS_MEDIUM; break;
         }
 
-    // MODE_FUEL_RESET's hold-to-fill gesture lives in fuel_calc.cpp (it
-    // mutates fuel state, so it belongs to the fuel domain - this module
-    // only RESOLVES the dial, it never acts on it).
-    // TODO(screens phase): MODE_DEBUG selects the dense diagnostics layout.
+    // The modes that DO things act on m.mode in their own modules - this
+    // one only RESOLVES the dial, it never acts on it:
+    //   MODE_FUEL_RESET -> the hold-to-fill gesture (fuel_calc.cpp: it
+    //                      mutates fuel state, so it belongs to the fuel
+    //                      domain)
+    //   MODE_DEBUG      -> the dense diagnostics pages (screens.cpp picks
+    //                      gaugeRenderDebug instead of the gauge layouts)
     }
 
 const char* modeName(GaugeMode m)

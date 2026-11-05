@@ -5,16 +5,18 @@
 // gauge knows about the car. The dataflow is strictly one-way:
 //
 //     input modules (can_bus, inputs)  --write-->  g_data  --read-->  consumers
-//                                                            (alarms, screens,
-//                                                             LED tach - later)
+//                                                            (alarms, audio,
+//                                                             screens, LED tach,
+//                                                             FRAM log)
 //
 // Why one big struct instead of values scattered across modules?
 //   * Every consumer sees a consistent snapshot - there is exactly one place
 //     a value can live, so no stale copies drift apart.
 //   * Debugging is trivial: print g_data and you know the whole system state.
-//   * Later phases (alarm logic, screens) depend only on this header, not on
+//   * The alarm logic, screens and LEDs depend only on this header, not on
 //     HOW a value was acquired. Swap the ECU protocol and nothing above the
-//     decoder changes.
+//     decoder changes (exactly what happened when the gauge moved from the
+//     Megasquirt broadcast to rusEFI's own).
 //
 // Thread-safety note: everything here is written and read from loop() context
 // only (the CAN interrupt fills a queue inside FlexCAN_T4; frames are decoded
@@ -27,62 +29,102 @@
 #include <Arduino.h>
 #include "config.h"
 
-// Bits of EcuData::engineBits - the Megasquirt 'engine' status bitfield
-// (broadcast group 1, byte 3). Bit meanings from the TunerStudio reference;
-// verify CRANK against the real ECU during bring-up.
-static const uint8_t ENGINE_BIT_READY    = 0x01; // engine ready to run
-static const uint8_t ENGINE_BIT_CRANKING = 0x02; // starter engaged
-static const uint8_t ENGINE_BIT_ASE      = 0x04; // afterstart enrichment active
-static const uint8_t ENGINE_BIT_WARMUP   = 0x08; // warmup enrichment active
-
 // --- values decoded from the ECU CAN broadcast --------------------------------
-// All temperatures are converted to Celsius at decode time (the MS protocol
-// broadcasts Fahrenheit; the warning thresholds in the project plan are C).
+// rusEFI's native broadcast (frames BASE0..BASE7, named as in rusEFI's DBC)
+// plus one byte of its MS Simplified dash broadcast (the target AFR).
+// Layouts: docs/ECU_CAN_SETUP.md. Units are converted at decode time to the
+// ones the project thinks in: C, kPa, psi for oil pressure (the plan's
+// thresholds are psi), lambda for mixture.
+//
+// How rusEFI encodes "no valid reading" (it never sends a separate flag):
+// coolant/oil/intake temperature 0 C, pedal/TPS -1 %, lambda 0. A dead oil
+// pressure sensor decodes as 0 psi (can_bus.cpp explains why).
+
+// Index into EcuData::frameLastRxMs - one slot per ECU frame we decode, so
+// staleness can be judged per frame.
+enum EcuFrame : uint8_t
+    {
+    ECU_F_STATUS = 0, // BASE0 - warning counter, last error, status bits
+    ECU_F_SPEEDS,     // BASE1 - rpm, timing, injector duty (the "ECU online" heartbeat)
+    ECU_F_THROTTLE,   // BASE2 - pedal + throttle position
+    ECU_F_SENSORS1,   // BASE3 - MAP, coolant, intake air temperature
+    ECU_F_SENSORS2,   // BASE4 - oil pressure, oil temperature, battery voltage
+    ECU_F_FUELING,    // BASE5 - injector pulse width
+    ECU_F_FUELING2,   // BASE6 - fuel trim, rusEFI's own fuel flow
+    ECU_F_LAMBDA,     // BASE7 - measured lambda
+    ECU_F_AFR_TARGET, // MS Simplified frame 0x5EA - target AFR (-> lambdaTarget)
+    ECU_F_COUNT
+    };
+
+// Bits of EcuData::statusBits = byte 4 of BASE0, verbatim (DBC bits 32..39).
+static const uint8_t ECU_STATUS_REV_LIMIT      = 0x01; // fuel or spark cut by rusEFI's limiter / limp logic
+static const uint8_t ECU_STATUS_MAIN_RELAY     = 0x02;
+static const uint8_t ECU_STATUS_FUEL_PUMP      = 0x04;
+static const uint8_t ECU_STATUS_CHECK_ENGINE   = 0x08;
+static const uint8_t ECU_STATUS_O2_HEATER      = 0x10;
+static const uint8_t ECU_STATUS_LAMBDA_PROTECT = 0x20; // rusEFI's lean protection is cutting
+static const uint8_t ECU_STATUS_FAN            = 0x40;
+static const uint8_t ECU_STATUS_FAN2           = 0x80;
 
 struct EcuData
     {
-    // group 0 (50 Hz)
-    uint16_t secondsOn;     // s   - how long the ECU has been powered
-    float    pw1Ms;         // ms  - main injector pulsewidth, bank 1 (fuel-burn math later)
-    float    pw2Ms;         // ms  - bank 2
+    // BASE0 - status
+    uint16_t warningCount;  // rusEFI's warning counter (counts every warning since boot)
+    uint16_t lastError;     // code of the most recent warning/error rusEFI raised
+    uint8_t  statusBits;    // ECU_STATUS_* flags
+
+    // BASE1
     uint16_t rpm;           // RPM
+    float    sparkAdvDeg;   // deg - ignition timing
+    float    injDutyPct;    // %   - injector duty, as rusEFI computes it
 
-    // group 1 (10 Hz)
-    float   sparkAdvDeg;    // deg BTDC - final ignition advance
-    uint8_t engineBits;     // ENGINE_BIT_* flags, e.g. cranking
-    float   afrTarget;      // AFR - bank 1 target (for the lambda-vs-target alarms)
-
-    // group 2 (50 Hz)
-    float baroKpa;          // kPa - barometric pressure
-    float mapKpa;           // kPa - manifold pressure (AFR-critical rule needs MAP > 90)
-    float matC;             // C   - manifold air temperature
-    float cltC;             // C   - coolant temperature
-
-    // group 3 (50 Hz)
+    // BASE2 - rusEFI sends -1 % for a sensor it doesn't have or can't trust
+    float pedalPct;         // %   - accelerator pedal (< 0 = none, e.g. a cable throttle)
     float tpsPct;           // %   - throttle position
+
+    // BASE3
+    float mapKpa;           // kPa - manifold pressure (part of the AFR-critical load rule)
+    float cltC;             // C   - coolant temperature
+    float matC;             // C   - intake air temperature
+
+    // BASE4
+    float oilPressPsi;      // psi - converted from rusEFI's kPa
+    float oilTempC;         // C
     float battVolts;        // V   - battery voltage as the ECU sees it
-    float afr;              // AFR - measured, bank 1
 
-    // group 4 (10 Hz)
-    float egoCorPct;        // %   - closed-loop EGO correction, bank 1
+    // BASE5
+    float injPwMs;          // ms  - injector pulse width INCLUDING rusEFI's dead-time
+                            //       correction (rusEFI computes 0 for a fuel cut)
 
-    // group 13 (50 Hz) - generic sensors, mapping defined in docs/ECU_CAN_SETUP.md
-    float oilPressPsi;      // psi - sensors1
-    float oilTempC;         // C   - sensors2
-    float spareSensor3;     // sensors3, decoded + printed so a future hookup "just works"
-    float spareSensor4;     // sensors4
+    // BASE6
+    float egoCorPct;        // %   - short-term fuel trim, bank 1
+    float fuelFlowGps;      // g/s - rusEFI's own fuel-flow figure (0 if its build
+                            //       doesn't compute one) - a cross-check for fuel_calc
 
-    // derived (computed in the superloop, not broadcast)
-    float injDutyPct;       // % - injector duty from pw1 + rpm
-    float lambdaErr2s;      // lambda error vs target, TWO-SECOND average (the
-                            // plan's AFR alarms are defined on this, not on
-                            // instantaneous readings). + = lean, - = rich.
-                            // 0 while the engine isn't running / data invalid.
+    // BASE7 + the MS dash frame
+    float lambda;           // measured lambda (0 = no valid reading)
+    float lambdaTarget;     // target lambda = target AFR / AFR_STOICH
+
+    // derived by mixture.cpp (the plan's AFR alarms are defined on these,
+    // never on instantaneous readings)
+    float lambdaErr2s;      // mean of (lambda - target) over the last
+                            // LAMBDA_AVG_WINDOW_MS of VALID samples. + = lean.
+                            // 0 while no valid samples exist.
+    bool  lambdaJudgeable;  // the window is full: the AFR alarms may judge it
+    bool  lambdaUnderLoad;  // ...and every sample in it was taken under load
+                            // (the AFR LEAN red rule)
 
     // bookkeeping
-    uint32_t groupLastRxMs[MS_CAN_NUM_GROUPS]; // millis() when each group last arrived
-                                               // (0 = never; drives staleness/NO CAN logic)
+    uint32_t frameLastRxMs[ECU_F_COUNT]; // millis() each frame last arrived
+                                         // (0 = never; drives staleness/NO CAN)
     uint32_t frameCount;    // decoded ECU frames since boot
+
+    bool revLimited() const  { return statusBits & ECU_STATUS_REV_LIMIT; }
+    bool checkEngine() const { return statusBits & ECU_STATUS_CHECK_ENGINE; }
+
+    // The driver's throttle demand: the pedal when the car has one (drive by
+    // wire), else the throttle plate. Negative = no trustworthy reading.
+    float throttlePct() const { return (pedalPct >= 0.0f) ? pedalPct : tpsPct; }
     };
 
 // --- values decoded from the JK BMS ---------------------------------------------
@@ -124,8 +166,9 @@ struct BmsData
     float maxCellTempC;     // C  - battery temp alarms use this one (hottest cell)
     float minCellTempC;     // C
 
-    // 0x359 - raw fault bitfields, kept verbatim for the alarm phase + debug.
-    // Bit meanings: Tables 1-7 in the protocol PDF.
+    // 0x359 - raw fault bitfields, kept verbatim. No alarm reads them yet -
+    // they reach the debug print and nothing else. Bit meanings: Tables 1-7
+    // in the protocol PDF.
     uint8_t protection[4];  // bytes 0-3: protection faults (tables 1-4)
     uint8_t alarm[2];       // bytes 4-5: early-warning alarms (tables 5-6)
     uint8_t sysError;       // byte 6:    system errors (table 7)
@@ -142,7 +185,7 @@ struct BmsData
     uint8_t mosStateBits;
 
     // bookkeeping
-    uint32_t frameLastRxMs[BMS_F_COUNT]; // 0 = never received (same idea as ECU groups)
+    uint32_t frameLastRxMs[BMS_F_COUNT]; // 0 = never received (same idea as the ECU frames)
     uint32_t frameCount;                 // decoded BMS frames since boot
 
     // convenience accessors (derived, always current with the raw fields)
@@ -178,13 +221,15 @@ struct FuelData
     bool     faultShort;    // wiring shorted to ground
 
     // -- calculated fuel (fuel_calc.cpp) --
-    bool  calcValid;        // false until seeded (sender bootstrap; FRAM later)
+    bool  calcValid;        // false until seeded (FRAM record at boot, else the sender)
     float calcGallons;      // best-estimate fuel on board
     float calcPct;          // calcGallons as % of FUEL_TANK_GAL
     float burnGph;          // smoothed burn rate, gal/hour (0 with engine off)
-    float burnedTotalGal;   // integrated burn since boot (debug + FRAM later)
+    float burnedTotalGal;   // lifetime burn (persisted in the FRAM fuel record -
+                            // the odometer for calibrating FUEL_CALC_TRIM)
 
-    // -- FUEL FILL gesture progress (fuel_calc.cpp writes, screens will draw) --
+    // -- FUEL FILL gesture progress (fuel_calc.cpp writes; only the serial
+    //    debug print shows it so far - no screen element draws it yet) --
     bool    fillActive;     // dial is sitting on the FUEL FILL detent
     uint8_t fillCansAdded;  // 5-gal cans credited during this visit
     bool    fillFullDone;   // full-tank reset applied during this visit
@@ -194,10 +239,10 @@ struct FuelData
 
 struct SwitchData
     {
-    bool headlights;        // raw electrical state of each 12V input;
-    bool brights;           // "is the blinker flashing" (on/off/on...) is a
-    bool blinkerL;          // consumer-side question for a later phase
-    bool blinkerR;
+    bool headlights;        // raw electrical state of each 12V input. The
+    bool brights;           // blinker inputs carry the flasher's on/off wave
+    bool blinkerL;          // itself, so drawing the raw state on screen IS
+    bool blinkerR;          // the blink (gauge_render.cpp)
 
     uint8_t  rotaryPos;       // 0..11, debounced. While the dial reads OPEN
                               //  it holds the last good position, and after
@@ -220,17 +265,16 @@ struct SwitchData
 
 // --- resolved gauge mode -----------------------------------------------------------
 // The rotary dial position, translated into DECISIONS by modesUpdate()
-// (src/modes.cpp) each tick. Consumers (LEDs, audio, later screens) read
-// these flags and never the raw position: what "position 4" means lives in
-// exactly one table (ROTARY_MODE_MAP in config.h), and a future remap of
-// the dial can't leave a consumer behind.
+// (src/modes.cpp) each tick. Consumers (LEDs, audio, screens, backlights)
+// read these flags and never the raw position: what "position 4" means
+// lives in exactly one table (ROTARY_MODE_MAP in config.h), and a future
+// remap of the dial can't leave a consumer behind.
 
 struct ModeData
     {
     GaugeMode mode;             // this tick's entry from ROTARY_MODE_MAP
     bool      silent;           // no voice clips, no flashing alarms
-    bool      displaysOff;      // all LEDs dark + backlights off (later: screen
-                                //  content too)
+    bool      displaysOff;      // all LEDs dark, screens black, backlights off
     bool      night;            // use the night color scheme (dim colors, no blue
                                 //  glare): headlights on, or Dark mode selected
     uint8_t   ledBrightness;    // 0..255 global LED scale for this tick
@@ -341,17 +385,24 @@ struct VehicleData
     AlarmsData alarms;
     FramData   fram;
 
-    uint32_t unknownFrameCount; // CAN frames nobody decoded - should sit at ~0
-                                // on a healthy bus; climbing means unexpected
-                                // traffic or a config mismatch
+    uint32_t unknownFrameCount; // standard-id CAN frames nothing here expects -
+                                // should sit at 0 on a healthy bus; climbing
+                                // means a config mismatch or a stranger
+    uint32_t ignoredFrameCount; // traffic we recognise but don't use (the other
+                                // rusEFI/MS/BMS frames, the wideband, 29-bit
+                                // ids) - climbs steadily, that's normal
 
-    // Staleness helpers - later phases turn these into the NO CAN / BATT CAN
-    // warnings.
-    bool ecuGroupFresh(uint8_t group, uint32_t maxAgeMs) const;
-    bool ecuOnline() const;
+    // Staleness helpers. NO CAN = !ecuDataComplete(), BATT CAN = !bmsOnline().
+    bool ecuFrameFresh(uint8_t frame, uint32_t maxAgeMs = ECU_FRESH_MS) const;
+    bool ecuOnline() const;           // heartbeat only: the rpm frame is arriving
+    bool ecuDataComplete() const;     // EVERY ECU frame the gauge decodes is fresh
+    uint8_t ecuFirstStaleFrame() const; // an EcuFrame, or ECU_F_COUNT if none
     bool bmsFrameFresh(uint8_t frame, uint32_t maxAgeMs) const;
     bool bmsOnline() const;
     };
+
+// Short name of an ECU frame for debug prints ("BASE4", "MS-AFRTGT").
+const char* ecuFrameName(uint8_t frame);
 
 // The one and only instance, defined in vehicle_data.cpp. As a global it is
 // zero-initialized before setup() runs - every value starts at a known 0.

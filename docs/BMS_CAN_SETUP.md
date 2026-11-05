@@ -14,15 +14,16 @@ This file is the contract between the BMS configuration and the firmware:
 | Bitrate | **500 kbps** — same bus as the ECU, everyone must match |
 
 Nothing else to configure: the protocol broadcasts a fixed frame set on a
-fixed **1-second cycle** (vs. the ECU's 50 Hz — hence the separate, much
+fixed **1-second cycle** (vs. the ECU's 20 Hz — hence the separate, much
 longer staleness window `BMS_OFFLINE_MS`).
 
-## Byte order — the opposite of the ECU
+## Byte order
 
-Deye frames are **little-endian** (low byte first); the Megasquirt broadcast
-is big-endian. `can_bus.cpp` has separate `le16`/`be16` helpers for this
-reason. If BMS values ever look absurd (a 16 V pack reading as ~1638 V,
-temperatures of thousands of degrees), byte order is the first suspect.
+Deye frames are **little-endian** (low byte first), the same as both rusEFI
+broadcasts. `can_bus.cpp` assembles every field explicitly with its
+`le16u`/`le16s` helpers. If BMS values ever look absurd (a 16 V pack reading
+as ~1638 V, temperatures of thousands of degrees), byte order is the first
+suspect.
 
 ## Frames the gauge decodes
 
@@ -35,10 +36,12 @@ temperatures of thousands of degrees), byte order is the first suspect.
 | 0x400 | 1 s | operation mode, failure level, cycle count, balance bits | status display; `failureLevel` is the BMS's own 0/1/2 severity summary |
 | 0x110 | 1 s | byte 7: MOSFET states | is the pack actually connected (charge/discharge FET on)? |
 
-Frames **not** decoded (ignored, counted as unknown traffic): 0x351 charge
-parameters, 0x35C request flags, 0x35E manufacturer name, 0x363/0x364/0x371,
-0x150/0x200/0x250 per-module summaries (duplicate the above at different
-resolutions), 0x500/0x550/0x600/0x650/0x700/0x750 versions/SN/statistics.
+Frames **not** decoded (recognised as expected traffic and counted as `ign=`
+in the ECU debug line, so they never inflate the `unk=` counter): 0x351
+charge parameters, 0x35C request flags, 0x35E manufacturer name,
+0x363/0x364/0x371, 0x150/0x200/0x250 per-module summaries (duplicate the
+above at different resolutions), 0x500/0x550/0x600/0x650/0x700/0x750
+versions/SN/statistics. The list lives in `k_bmsUnusedIds` in `can_bus.cpp`.
 
 ### Per-cell voltages
 
@@ -58,11 +61,21 @@ switch: `BMS_SEND_PCS_HEARTBEAT` in `config.h`.
 
 ## id collision warning
 
-The BMS's SN-code frame **0x600 (1536) falls inside the ECU broadcast id
-range** (base 1520 + groups 0–63 = 1520–1583). The firmware decodes neither
-0x600 nor MS group 16, so today this is harmless — but **never enable MS
-broadcast group 16 (sensors13–16)** without first moving one of the two id
-ranges, or the two devices will transmit on the same id.
+The BMS's per-module summary frame **0x200** is also the **default base
+address of rusEFI's native broadcast** (0x200-0x20B), which the Super uaEFI
+enables out of the box. Two nodes transmitting the same id corrupt each
+other's frames, so the ECU's base address is moved to **0x680 (1664)**; see
+`ECU_CAN_SETUP.md`. Every id on the bus, for reference:
+
+| Ids | Sender |
+|---|---|
+| 0x110, 0x150, 0x200, 0x250, 0x351, 0x355, 0x356, 0x359, 0x35C, 0x35E, 0x361, 0x363, 0x364, 0x371, 0x400, 0x500, 0x550, 0x600, 0x650, 0x700, 0x750 | JK BMS (this file) |
+| 0x305 | the gauge (PCS heartbeat) |
+| 0x190-0x19F (+ 29-bit frames) | the ECU's on-board wideband controller |
+| 0x5E8-0x5EC | rusEFI MS Simplified Broadcast |
+| 0x680-0x68B | rusEFI native broadcast (moved from 0x200) |
+
+Before adding anything to the bus, check its ids against this table.
 
 ## Things to verify at first bring-up
 

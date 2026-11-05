@@ -15,28 +15,54 @@
 
 // --- superloop timing ---------------------------------------------------------
 
-static const uint32_t TICK_FAST_MS = 20;   // 50 Hz: input polling, math, (later) LEDs + screens
-static const uint32_t TICK_SLOW_MS = 1000; // 1 Hz: debug print, (later) FRAM log + audio arbitration
+static const uint32_t TICK_FAST_MS = 20;   // 50 Hz: inputs, mixture window, alarms, LEDs, screens, backlights
+static const uint32_t TICK_SLOW_MS = 1000; // 1 Hz: BMS heartbeat, audio arbitration, FRAM, debug print
 
 // --- CAN bus ------------------------------------------------------------------
-// One physical bus shared by the ECU and the JK BMS. Everyone must agree on
-// the bitrate. The ECU side is documented in docs/ECU_CAN_SETUP.md - keep
-// that file and these constants in sync!
+// One physical bus shared by the rusEFI ECU (a Super uaEFI - it has a single
+// CAN port, so its on-board wideband controller talks on this bus too), the
+// JK BMS and this gauge. Everyone must agree on the bitrate. The ECU side is
+// documented in docs/ECU_CAN_SETUP.md - keep that file and these constants
+// in sync!
 
-static const uint32_t CAN_BITRATE = 500000; // 500 kbps (MS broadcast default)
+static const uint32_t CAN_BITRATE = 500000; // 500 kbps (rusEFI default)
 
-// Megasquirt "Advanced Real-Time Data Broadcast": each enabled 8-byte group
-// arrives as its own CAN frame at (base id + group number), big-endian.
-static const uint32_t MS_CAN_BASE_ID    = 1520; // 0x5F0, TunerStudio default
-static const uint8_t  MS_CAN_NUM_GROUPS = 64;   // groups 0..63 exist in the spec
+// rusEFI's native broadcast ("Enable rusEFI CAN broadcast" in TunerStudio):
+// twelve fixed 8-byte frames at base + 0..11, LITTLE-endian, all sent
+// together once per "rusEFI CAN data period". Their layouts are defined by
+// rusEFI itself (firmware/controllers/can/rusEFI_CAN_verbose.dbc, which
+// calls them BASE0..BASE11); can_bus.cpp decodes BASE0..BASE7.
+//
+// rusEFI's default base is 0x200 - the same id as one of the JK BMS's
+// frames (docs/BMS_CAN_SETUP.md). Two nodes transmitting one id corrupt
+// each other, so the ECU is moved: set "rusEFI CAN data base address" to
+// 1664 (= 0x680) in TunerStudio. 0x680..0x68B is clear of everything else
+// on this bus.
+static const uint32_t RUSEFI_CAN_BASE_ID     = 0x680;
+static const uint8_t  RUSEFI_CAN_FRAME_COUNT = 12; // BASE0..BASE11
 
-// Freshness windows: how old a group's data may be before we call it stale.
-// Rule of thumb: several times the broadcast period, so one lost frame does
-// not cause a false "NO CAN" panic. (50 Hz group -> 20 ms period -> 250 ms
-// allows ~12 lost frames before alarm.)
-static const uint32_t ECU_FRESH_FAST_MS = 250;  // for groups broadcast at 50 Hz
-static const uint32_t ECU_FRESH_SLOW_MS = 1500; // for groups broadcast at 10 Hz
-static const uint32_t ECU_OFFLINE_MS    = 500;  // no group-0 frame for this long = ECU offline
+// The one value the native broadcast lacks is the TARGET lambda, which the
+// mixture alarms are judged against. rusEFI's "MS Simplified Broadcast"
+// (TunerStudio: CAN dash type) carries it in its third frame as 'afrtgt1':
+// one byte, AFR x 10, = target lambda x 14.7. That byte is all we take from
+// the five MS frames; the other four are ignored. rusEFI fixes their ids
+// (1512..1516) and sends them every 10 ms.
+static const uint32_t MS_DASH_BASE_ID       = 0x5E8; // 1512
+static const uint8_t  MS_DASH_FRAME_COUNT   = 5;
+static const uint32_t MS_DASH_AFR_TARGET_ID = 0x5EA; // 1514: afrtgt1 in byte 0
+
+// rusEFI wideband controllers - including the Super uaEFI's on-board one -
+// broadcast their own lambda frames from 0x190 up. Expected traffic, but not
+// decoded: the ECU already re-broadcasts the lambda it uses in BASE7.
+static const uint32_t RUSEFI_WBO_FIRST_ID = 0x190;
+static const uint32_t RUSEFI_WBO_LAST_ID  = 0x19F;
+
+// Freshness: how old an ECU frame may be before its values stop counting
+// (display shows "--", alarms gate off, NO CAN raises). Several broadcast
+// periods, so a lost frame never trips anything. Sized for a rusEFI CAN
+// data period of 50 ms or faster; rusEFI slows its broadcast 5x while
+// TunerStudio talks to it OVER CAN, and at 50 ms that (250 ms) still fits.
+static const uint32_t ECU_FRESH_MS = 500;
 
 // JK BMS speaking the "Deye" protocol (PCS CAN-Bus-protocol-DY-low-voltage,
 // select protocol 001 in the JK app). Standard 11-bit ids, LITTLE-endian
@@ -152,10 +178,10 @@ static const uint8_t  FUEL_SLOSH_MEDIAN_N  = 9;     // 9 samples = 4.5 s window
 static const float    FUEL_SLOSH_TAU_S     = 30.0f; // stage-2 smoothing
 
 // --- calculated fuel: injector-pulse integration (fuel_calc.cpp) -------------------
-// The ECU broadcasts the injector pulse width it is commanding 50x a second.
-// Injectors are precision metering devices: open time x flow rate = fuel
-// delivered. Integrating that gives a fuel estimate far steadier than any
-// float in a sloshing tank.
+// rusEFI broadcasts the injector pulse width it is commanding (BASE5, once
+// per CAN data period). Injectors are precision metering devices: open time
+// x flow rate = fuel delivered. Integrating that gives a fuel estimate far
+// steadier than any float in a sloshing tank.
 
 static const uint8_t ENGINE_CYLINDERS = 6; // M54: one injector per cylinder
 
@@ -166,11 +192,14 @@ static const float INJ_FLOW_CC_PER_MIN = 254.0f;
 
 // Injector dead time vs battery voltage, from the same spec sheet
 // ("ip_ti_add_dly__vb"). An injector is an electromagnet: it takes this long
-// to physically open after the pulse starts, during which NO fuel flows. The
-// ECU adds dead time to the pulse it broadcasts, so the fuel math must
-// subtract it back out - at a 2 ms idle pulse the ~0.4 ms dead time is 20%
-// of the reading, so skipping this correction would overcount idle burn by
-// a fifth. Interpolated linearly, clamped at the table ends.
+// to physically open after the pulse starts, during which NO fuel flows.
+// rusEFI adds its own dead-time correction onto the pulse it broadcasts
+// (InjectorModelBase::getInjectionDuration returns base + dead time), so the
+// fuel math must subtract it back out - at a 2 ms idle pulse the ~0.4 ms
+// dead time is 20% of the reading, so skipping this correction would
+// overcount idle burn by a fifth. Keep this table the same as the injector
+// dead-time (battery lag) table in the rusEFI tune - the subtraction is only
+// right if both sides agree. Interpolated linearly, clamped at the ends.
 struct InjDeadTime
     {
     float volts;
@@ -287,12 +316,13 @@ enum GaugeMode : uint8_t
     MODE_BRIGHT = 0,   // full brightness
     MODE_MEDIUM,       // mid brightness
     MODE_DARK,         // minimum brightness + night color scheme
-    MODE_DEBUG,        // TODO(screens phase): dense all-parameters layout
+    MODE_DEBUG,        // dense all-parameters pages on the three screens
+                       // (gauge_render.cpp, gaugeRenderDebug)
     MODE_SILENT,       // no voice, no flashing - "I know, stop telling me":
                        // for a known-bad sensor that would nag all stage
     MODE_FUEL_RESET,   // the FUEL FILL detent: hold 30 s = +5 gal,
                        // hold 60 s = full-tank reset (fuel_calc.cpp)
-    MODE_DISPLAYS_OFF, // every LED dark; later also screens + backlights.
+    MODE_DISPLAYS_OFF, // every LED dark, screens black, backlights off.
                        // Audio alarms STILL play - only the light goes away.
     MODE_UNASSIGNED,   // spare detents - Darude Sandstorm, fun themes and
                        // clock-set from the plan land on these one day
@@ -303,9 +333,9 @@ static const GaugeMode ROTARY_MODE_MAP[ROTARY_POSITIONS] =
     MODE_BRIGHT,       // position 0  (assumed = the 0V end of the ladder)
     MODE_MEDIUM,       // position 1
     MODE_DARK,         // position 2
-    MODE_DEBUG,        // position 3   (reserved, no behavior yet)
+    MODE_DEBUG,        // position 3
     MODE_SILENT,       // position 4
-    MODE_FUEL_RESET,   // position 5   (reserved, no behavior yet)
+    MODE_FUEL_RESET,   // position 5
     MODE_DISPLAYS_OFF, // position 6
     MODE_UNASSIGNED,   // position 7
     MODE_UNASSIGNED,   // position 8
@@ -324,11 +354,12 @@ static const GaugeMode ROTARY_MODE_MAP[ROTARY_POSITIONS] =
 static const int SWITCH_ON_COUNTS  = 745; // ~0.60 V at the pin (~6 V at the input)
 static const int SWITCH_OFF_COUNTS = 496; // ~0.40 V at the pin (~4 V at the input)
 
-// --- derived-value constants ------------------------------------------------------
-// Injector duty cycle is computed, not broadcast:
-//   duty% = pw(ms) * rpm / (1200 / events_per_cycle)
+// --- injection mode ----------------------------------------------------------------
 // Sequential injection (rusEFI on the M54): each injector fires once per
-// engine cycle = once per two crank revolutions -> 1 event per cycle.
+// engine cycle = once per two crank revolutions -> 1 event per cycle. The
+// fuel calculation (fuel_calc.cpp) needs this to turn a pulse width into a
+// flow rate. (Injector DUTY is not computed by the gauge - rusEFI broadcasts
+// its own figure in BASE1.)
 
 static const float INJ_EVENTS_PER_ENGINE_CYCLE = 1.0f;
 
@@ -347,7 +378,11 @@ static const float INJ_EVENTS_PER_ENGINE_CYCLE = 1.0f;
 // otherwise you would sit in the pits staring at a red OIL LOW.
 static const uint16_t ENGINE_RUNNING_RPM = 400;
 
-static const float AFR_STOICH = 14.7f; // petrol; converts AFR <-> lambda
+// Petrol stoichiometric AFR. Only used to turn the MS dash frame's target AFR
+// back into lambda, so it must equal the factor rusEFI multiplied by when it
+// sent it: rusEFI's STOICH_RATIO, 14.7f (rusefi_types.h) - NOT the "stoich
+// ratio" setting in the tune.
+static const float AFR_STOICH = 14.7f;
 
 // oil pressure (psi). "Ratio" = rpm / psi: pressure demand scales with rpm,
 // so 4000 rpm at 30 psi (ratio 133) is marginal while idle at 15 psi is fine.
@@ -359,7 +394,7 @@ static const float OILP_RATIO_CRIT    = 250.0f;
 static const float OILP_HYST_PSI      = 2.0f;
 static const float OILP_RATIO_HYST    = 15.0f;
 
-// oil temperature (deg C, from sensors2)
+// oil temperature (deg C, rusEFI's Oil Temperature sensor via BASE4)
 static const float OILT_COLD_C = 75.0f;
 static const float OILT_WARN_C = 130.0f;
 static const float OILT_CRIT_C = 140.0f;
@@ -371,14 +406,50 @@ static const float CLT_CRIT_C = 115.0f;
 
 static const float TEMP_HYST_C = 3.0f; // shared by all temperature alarms
 
-// lambda vs target (evaluated on a TWO-SECOND average per the plan; the
-// averaging itself happens in computeDerived() -> g_data.ecu.lambdaErr2s)
+// lambda vs target (judged on a TWO-SECOND average of lambda - target per the
+// plan; + = lean). The average and the rules for which samples may enter it
+// live in mixture.cpp - see the "mixture window" block right below.
 static const float LAMBDA_RICH_DELTA    = 0.10f; // this much below target -> blue info
 static const float LAMBDA_LEAN_WARN     = 0.03f; // above target -> yellow
-static const float LAMBDA_LEAN_CRIT     = 0.05f; // above target AND on boost/load...
-static const float LAMBDA_CRIT_MIN_MAP  = 90.0f; // ...i.e. MAP above this (kPa)
+static const float LAMBDA_LEAN_CRIT     = 0.05f; // above target AND under load for the
+                                                 // whole window -> red. "Load" =
+static const float LAMBDA_CRIT_MIN_MAP  = 90.0f; //   MAP above this (kPa, the plan's rule)
+static const float LAMBDA_CRIT_MIN_THROTTLE_PCT = 70.0f; // OR pedal/TPS at least this: a
+                                                 // naturally aspirated engine at altitude
+                                                 // never sees 90 kPa (barometric pressure
+                                                 // is ~84 kPa at 1500 m), so MAP alone would
+                                                 // disarm the red on mountain stages. Set
+                                                 // above 100 to restore the MAP-only rule.
 static const float LAMBDA_HYST          = 0.01f;
-static const float LAMBDA_AVG_TAU_S     = 2.0f;
+
+// --- mixture window (mixture.cpp) ---------------------------------------------------
+// A wideband only tells the truth while the engine burns what the ECU
+// meters. On overrun it doesn't: a fuel cut (DFCO, rev limiter) shows the
+// sensor free air, and closed-throttle misfires push unburnt oxygen past it.
+// An average that swallows a lift-off reads LEAN for seconds afterward - the
+// old averaging turned every overrun into a yellow AFR LEAN, and into a RED
+// one the moment the throttle reopened (MAP > 90 kPa with the average still
+// full of overrun). So a sample only enters the window while the driver is
+// asking for power, the ECU isn't cutting fuel, and the sensor has had time
+// to recover from the last time that wasn't true. Full rules: mixture.cpp.
+//
+// Price of that honesty: once the throttle opens, a real lean condition can
+// reach the alarm table no sooner than HOLDOFF + WINDOW (3 s here) plus the
+// alarm's own set time.
+static const uint32_t LAMBDA_AVG_WINDOW_MS    = 2000; // the plan's two seconds; a multiple of
+                                                      // TICK_FAST_MS (one sample per tick)
+static const float    LAMBDA_MIN_THROTTLE_PCT = 5.0f; // pedal (TPS without a pedal sensor) at or
+                                                      // above this = asking for power. TUNE: keep it
+                                                      // above the tune's DFCO TPS threshold
+                                                      // (coastingFuelCutTps), so every fuel-cut
+                                                      // lift falls below it
+static const uint32_t LAMBDA_HOLDOFF_MS       = 1000; // after any excluded sample, ignore this long:
+                                                      // exhaust transport + sensor lag + the intake
+                                                      // fuel film refilling after a cut. TUNE from a
+                                                      // log of a lift-and-reapply
+static const float    LAMBDA_SENSOR_MIN       = 0.5f; // below this is not a reading: rusEFI sends
+                                                      // lambda 0 while the wideband warms up or has
+                                                      // failed (and a target of 0 before it has one)
 
 // 12V system voltage (as the ECU measures it)
 static const float VOLT_LOW_WARN_V  = 14.0f; // alternator should hold >= this when running
@@ -447,7 +518,8 @@ static const uint32_t AUDIO_FINISH_GUARD_MS = 400;
 // library on pin 8 ("LED Serial" in the pinout = Serial2 TX): the library
 // encodes the LED bitstream into serial framing and a DMA engine clocks it
 // out on its own, so repainting the strip costs the superloop microseconds.
-// Repainted on the 20 ms tick = 50 Hz, matching the ECU's rpm broadcast.
+// Repainted on the 20 ms tick = 50 Hz (rpm itself updates at the rusEFI CAN
+// data period - see docs/ECU_CAN_SETUP.md).
 //
 // Strip layout (logical index 0 = LEFT end):
 //
@@ -744,8 +816,8 @@ static const uint32_t COL_BANNER_RED    = 0xEB232D; // red fill, white text
 
 // --- FRAM: FM24V10 1-Mbit I2C F-RAM ---------------------------------------------------
 // Nonvolatile memory for two jobs: the persistent fuel record (survives the
-// kill switch) and the black-box flight recorder (backup to the ECU's SD
-// card). On the Wire pins per the pinout table: 18 = SDA, 19 = SCL.
+// kill switch) and the black-box flight recorder (backup to the ECU's own
+// log). On the Wire pins per the pinout table: 18 = SDA, 19 = SCL.
 // A1/A2/WP all have internal pulldowns and are left grounded -> device
 // address 0x50 (+1 for the upper 64 KB page). SDA/SCL each need an external
 // pull-up to 3.3V: 2.2k is right for 1 MHz operation.

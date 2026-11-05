@@ -5,20 +5,24 @@
 //
 //   * While an injector is open, fuel flows at a fixed rate set by the
 //     nozzle and the rail pressure: 254 cm3/min for our injectors at 3.5 bar.
-//   * The ECU broadcasts the ELECTRICAL pulse width (pw1). The injector is
-//     an electromagnet, so for the first ~0.4 ms of every pulse (more at low
-//     battery voltage) it is still physically closed - the ECU adds that
-//     "dead time" onto the pulse it commands, and we subtract it back out:
-//         open time = pw1 - deadTime(battVolts)
+//   * rusEFI broadcasts the ELECTRICAL pulse width (BASE5 "InjPW"). The
+//     injector is an electromagnet, so for the first ~0.4 ms of every pulse
+//     (more at low battery voltage) it is still physically closed - rusEFI
+//     adds that "dead time" onto the pulse it commands, and we subtract it
+//     back out:
+//         open time = injPw - deadTime(battVolts)
+//     (For a fuel cut rusEFI computes a 0 ms pulse - getInjectionDuration()
+//     returns 0 for zero fuel mass - which this math already turns into
+//     zero flow.)
 //   * With sequential injection each injector fires once per engine cycle =
 //     once per TWO crank revolutions, so each injector fires rpm/120 times
 //     per second, and there are six of them.
 //
 //   fuel rate (cm3/s) =
 //       cylinders x (flow/60) x [openMs x (rpm/120) / 1000] x trim
-//        \           \             \
-//         6           cm3 per       fraction of each second the injector
-//                     second open   is actually flowing ("duty")
+//           |           |             |
+//           6        cm3 per       fraction of each second the injector
+//                    second open   is actually flowing ("duty")
 //
 // Each 20 ms tick contributes rate x dt to the total. Sanity anchor: 10 ms
 // open at 6000 rpm is 50% duty = 12.7 cm3/s = ~12 gal/h - full-load-ish
@@ -93,7 +97,8 @@ static void integrateBurn()
     // across the whole gap. The honest answer during a gap is "we don't
     // know what burned" - the NO CAN alarm tells the driver the estimate
     // is degraded, and the trim calibration absorbs what little is lost.
-    if (!g_data.ecuOnline() || g_data.ecu.rpm == 0)
+    if (!g_data.ecuOnline() || !g_data.ecuFrameFresh(ECU_F_FUELING)
+        || g_data.ecu.rpm == 0)
         {
         s_lastIntegrateMs = 0;
         f.burnGph = 0.0f;
@@ -111,12 +116,12 @@ static void integrateBurn()
     if (dtS <= 0.0f || dtS > 0.5f)
         return; // scheduler hiccup - skip one tick rather than mis-integrate
 
-    // Dead-time lookup wants the system voltage; group 3 carries it. If that
-    // one group happens to be stale, assume normal alternator voltage rather
+    // Dead-time lookup wants the system voltage; BASE4 carries it. If that
+    // one frame happens to be stale, assume normal alternator voltage rather
     // than halting the whole estimate over a 0.1 ms detail.
-    const float volts = g_data.ecuGroupFresh(3, ECU_FRESH_FAST_MS)
+    const float volts = g_data.ecuFrameFresh(ECU_F_SENSORS2)
                             ? g_data.ecu.battVolts : 14.0f;
-    const float openMs = g_data.ecu.pw1Ms - injDeadTimeMs(volts);
+    const float openMs = g_data.ecu.injPwMs - injDeadTimeMs(volts);
 
     float ccPerS = 0.0f;
     if (openMs > 0.0f)

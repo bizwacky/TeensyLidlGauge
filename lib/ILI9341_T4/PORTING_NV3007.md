@@ -2,11 +2,15 @@
 
 This is [vindar/ILI9341_T4](https://github.com/vindar/ILI9341_T4) modified to drive
 the EastRising **ER-TFT2.79-1** bar display (2.79", 142x428 pixels, **NV3007**
-controller, 4-wire SPI). The folder is still a git clone, so you can always see
-every modification against the original with:
+controller, 4-wire SPI). The folder is vendored into the gauge repository (it is
+no longer a git clone of its own), starting from upstream **v1.7.1, commit
+`bee2957`**. To see every modification against the original, check that commit
+out of the upstream repo and diff the two trees:
 
 ```
-cd lib/ILI9341_T4 && git diff
+git clone https://github.com/vindar/ILI9341_T4 /tmp/ILI9341_T4-upstream
+git -C /tmp/ILI9341_T4-upstream checkout bee2957
+diff -ru /tmp/ILI9341_T4-upstream/src lib/ILI9341_T4/src
 ```
 
 ## Why this library works for the NV3007 at all
@@ -162,7 +166,8 @@ target is realistic for gauge-style content.
 ## What was deliberately NOT changed
 
 - Class/namespace/macro names (`ILI9341_T4::ILI9341Driver`, ...) - keeping the
-  upstream names makes `git diff` small and future upstream merges easy.
+  upstream names keeps the diff against upstream small and future upstream
+  merges easy.
 - The `examples/` folder - still the upstream ILI9341 examples; sizes and pins
   do not match this display. See the project's `src/main.cpp` instead.
 - The XPT2046 touch code - dead code for us (disabled when miso=255).
