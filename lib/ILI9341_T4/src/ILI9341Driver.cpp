@@ -1,0 +1,3463 @@
+/******************************************************************************
+*  ILI9341_T4 library for driving an ILI9341 screen via SPI with a Teensy 4/4.1
+*  Implements vsync and differential updates from a memory framebuffer.
+*
+*  Copyright (c) 2020 Arvind Singh.  All right reserved.
+*
+* This library is free software; you can redistribute it and/or
+*  modify it under the terms of the GNU Lesser General Public
+*  License as published by the Free Software Foundation; either
+*  version 2.1 of the License, or (at your option) any later version.
+*
+* This library is distributed in the hope that it will be useful,
+* but WITHOUT ANY WARRANTY; without even the implied warranty of
+*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+*  Lesser General Public License for more details.
+*
+*  You should have received a copy of the GNU Lesser General Public
+*  License along with this library; if not, write to the Free Software
+*  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+*******************************************************************************/
+
+
+#include "ILI9341Driver.h"
+#include "font_ILI9341_T4.h"
+
+#include <SPI.h>
+
+
+
+namespace ILI9341_T4
+{
+
+
+
+/** ILI9341 command codes */
+
+#define ILI9341_T4_NOP 0x00
+#define ILI9341_T4_SWRESET 0x01
+#define ILI9341_T4_RDDID 0x04
+#define ILI9341_T4_RDDST 0x09
+
+#define ILI9341_T4_SLPIN 0x10
+#define ILI9341_T4_SLPOUT 0x11
+#define ILI9341_T4_PTLON 0x12
+#define ILI9341_T4_NORON 0x13
+
+#define ILI9341_T4_RDMODE 0x0A
+#define ILI9341_T4_RDMADCTL 0x0B
+#define ILI9341_T4_RDPIXFMT 0x0C
+#define ILI9341_T4_RDIMGFMT 0x0D
+#define ILI9341_T4_RDSGNMODE 0x0E
+#define ILI9341_T4_RDSELFDIAG 0x0F
+
+#define ILI9341_T4_INVOFF 0x20
+#define ILI9341_T4_INVON 0x21
+#define ILI9341_T4_GAMMASET 0x26
+#define ILI9341_T4_DISPOFF 0x28
+#define ILI9341_T4_DISPON 0x29
+
+#define ILI9341_T4_CASET 0x2A
+#define ILI9341_T4_PASET 0x2B
+#define ILI9341_T4_RAMWR 0x2C
+#define ILI9341_T4_RAMRD 0x2E
+
+#define ILI9341_T4_PTLAR 0x30
+#define ILI9341_T4_MADCTL 0x36
+#define ILI9341_T4_VSCRSADD 0x37
+#define ILI9341_T4_PIXFMT 0x3A
+
+#define ILI9341_T4_GSLINE 0x45
+
+#define ILI9341_T4_FRMCTR1 0xB1
+#define ILI9341_T4_FRMCTR2 0xB2
+#define ILI9341_T4_FRMCTR3 0xB3
+#define ILI9341_T4_INVCTR 0xB4
+#define ILI9341_T4_DFUNCTR 0xB6
+
+#define ILI9341_T4_PWCTR1 0xC0
+#define ILI9341_T4_PWCTR2 0xC1
+#define ILI9341_T4_PWCTR3 0xC2
+#define ILI9341_T4_PWCTR4 0xC3
+#define ILI9341_T4_PWCTR5 0xC4
+#define ILI9341_T4_VMCTR1 0xC5
+#define ILI9341_T4_VMCTR2 0xC7
+
+#define ILI9341_T4_RDID1 0xDA
+#define ILI9341_T4_RDID2 0xDB
+#define ILI9341_T4_RDID3 0xDC
+#define ILI9341_T4_RDID4 0xDD
+
+#define ILI9341_T4_GMCTRP1 0xE0
+#define ILI9341_T4_GMCTRN1 0xE1
+#define ILI9341_T4_PWCTR6  0xFC
+
+
+
+
+    /* NV3007: refresh-rate control is not implemented for this controller (the
+       frame-rate registers live in the undocumented vendor page) so the display
+       always runs at its power-on refresh rate, assumed to be the usual ~60Hz.
+       Every 'mode' therefore reports the same rate. Without MISO the real rate
+       cannot be measured either, so this value is only used for internal timer
+       bookkeeping: with vsync disabled a small error here is harmless. */
+    static const float ILI9341_T4_refresh_rates[] PROGMEM  = { 60.0f,60.0f,60.0f,60.0f,60.0f,60.0f,60.0f,60.0f,
+                                                               60.0f,60.0f,60.0f,60.0f,60.0f,60.0f,60.0f,60.0f,
+                                                               60.0f,60.0f,60.0f,60.0f,60.0f,60.0f,60.0f,60.0f,
+                                                               60.0f,60.0f,60.0f,60.0f,60.0f,60.0f,60.0f,60.0f };
+
+
+
+    /**********************************************************************************************************
+    * Initialization and general settings
+    ***********************************************************************************************************/
+
+
+    FLASHMEM ILI9341Driver::ILI9341Driver(uint8_t cs, uint8_t dc, uint8_t sclk, uint8_t mosi, uint8_t miso, uint8_t rst, uint8_t touch_cs, uint8_t touch_irq)
+        {
+        // general
+        _width = ILI9341_T4_TFTWIDTH;
+        _height = ILI9341_T4_TFTHEIGHT;
+        _rotation = 0;
+        _refreshmode = 0; 
+        _irq_priority = ILI9341_T4_DEFAULT_IRQ_PRIORITY;
+        _outputStream = nullptr;
+
+        // buffering
+        _late_start_ratio = ILI9341_T4_DEFAULT_LATE_START_RATIO;
+        _late_start_ratio_override = true;
+        _diff_gap = ILI9341_T4_DEFAULT_DIFF_GAP;
+        _vsync_spacing = ILI9341_T4_DEFAULT_VSYNC_SPACING;
+        _diff1 = nullptr;
+        _diff2 = nullptr;
+        _fb1 = nullptr;
+        _dummydiff1 = &_dd1;
+        _dummydiff2 = &_dd2;
+        _mirrorfb = nullptr;
+        _ongoingDiff = nullptr;
+
+        _compare_mask = 0; 
+
+        // vsync
+        _period = 0;        
+        _synced_em = 0;
+        _synced_scanline = 0;
+
+        // dma
+        _fb = nullptr;
+        _diff = nullptr;
+        _dma_state = ILI9341_T4_DMA_IDLE;
+        _dmaCB = nullptr;
+        _dmaCBdata = nullptr;
+        _last_delta = 0;         
+        _timeframestart = 0;
+        _last_y = 0;
+
+        // spi
+        _cs = cs;
+        _dc = dc;
+        _sclk = sclk;
+        _mosi = mosi;
+        _miso = miso;
+        _rst = rst;
+
+        _touch_cs = touch_cs;
+        _touch_irq = touch_irq;
+
+        _spi_num = 255;
+        _cspinmask = 0;
+        _csport = NULL;
+        _hardware_dc = false;
+
+        _setTouchInterrupt();
+        _timerinit();
+
+        statsReset();
+        }
+
+
+
+
+
+    FLASHMEM bool ILI9341Driver::begin(uint32_t spi_clock, uint32_t spi_clock_read)
+        {
+        // *** NV3007 / ER-TFT2.79-1 port ***
+        //
+        // Initialization sequence for the NV3007, transcribed byte-for-byte from
+        // the EastRising demo code (lcd_Initial() in 'ER-TFT2.79-1-4wire SPI/lcd.h').
+        // Most registers live in a vendor page selected with 0xFF 0xA5 and are not
+        // publicly documented (power pump, GOA/gate driving, gamma...): treat them
+        // as a black box that must be sent exactly as given.
+        //
+        // Format of the array: { 1+nb_params, command, params... , 0 }
+        static const uint8_t init_commands[] = {
+                                                 2, 0xFF, 0xA5,              // select vendor register page
+                                                 2, 0x9A, 0x08,              // power/pump settings ...
+                                                 2, 0x9B, 0x08,
+                                                 2, 0x9C, 0xB0,
+                                                 2, 0x9D, 0x16,
+                                                 2, 0x9E, 0xC4,
+                                                 3, 0x8F, 0x55, 0x04,
+                                                 2, 0x84, 0x90,
+                                                 2, 0x83, 0x7B,
+                                                 2, 0x85, 0x33,
+                                                 2, 0x60, 0x00,              // gate timing settings ...
+                                                 2, 0x70, 0x00,
+                                                 2, 0x61, 0x02,
+                                                 2, 0x71, 0x02,
+                                                 2, 0x62, 0x04,
+                                                 2, 0x72, 0x04,
+                                                 2, 0x6C, 0x29,
+                                                 2, 0x7C, 0x29,
+                                                 2, 0x6D, 0x31,
+                                                 2, 0x7D, 0x31,
+                                                 2, 0x6E, 0x0F,
+                                                 2, 0x7E, 0x0F,
+                                                 2, 0x66, 0x21,
+                                                 2, 0x76, 0x21,
+                                                 2, 0x68, 0x3A,
+                                                 2, 0x78, 0x3A,
+                                                 2, 0x63, 0x07,
+                                                 2, 0x73, 0x07,
+                                                 2, 0x64, 0x05,
+                                                 2, 0x74, 0x05,
+                                                 2, 0x65, 0x02,
+                                                 2, 0x75, 0x02,
+                                                 2, 0x67, 0x23,
+                                                 2, 0x77, 0x23,
+                                                 2, 0x69, 0x08,
+                                                 2, 0x79, 0x08,
+                                                 2, 0x6A, 0x13,
+                                                 2, 0x7A, 0x13,
+                                                 2, 0x6B, 0x13,
+                                                 2, 0x7B, 0x13,
+                                                 2, 0x6F, 0x00,
+                                                 2, 0x7F, 0x00,
+                                                 2, 0x50, 0x00,
+                                                 2, 0x52, 0xD6,
+                                                 2, 0x53, 0x08,
+                                                 2, 0x54, 0x08,
+                                                 2, 0x55, 0x1E,
+                                                 2, 0x56, 0x1C,
+                                                 4, 0xA0, 0x2B, 0x24, 0x00,  // GOA map select ...
+                                                 2, 0xA1, 0x87,
+                                                 2, 0xA2, 0x86,
+                                                 2, 0xA5, 0x00,
+                                                 2, 0xA6, 0x00,
+                                                 2, 0xA7, 0x00,
+                                                 2, 0xA8, 0x36,
+                                                 2, 0xA9, 0x7E,
+                                                 2, 0xAA, 0x7E,
+                                                 2, 0xB9, 0x85,
+                                                 2, 0xBA, 0x84,
+                                                 2, 0xBB, 0x83,
+                                                 2, 0xBC, 0x82,
+                                                 2, 0xBD, 0x81,
+                                                 2, 0xBE, 0x80,
+                                                 2, 0xBF, 0x01,
+                                                 2, 0xC0, 0x02,
+                                                 2, 0xC1, 0x00,
+                                                 2, 0xC2, 0x00,
+                                                 2, 0xC3, 0x00,
+                                                 2, 0xC4, 0x33,
+                                                 2, 0xC5, 0x7E,
+                                                 2, 0xC6, 0x7E,
+                                                 3, 0xC8, 0x33, 0x33,
+                                                 2, 0xC9, 0x68,
+                                                 2, 0xCA, 0x69,
+                                                 2, 0xCB, 0x6A,
+                                                 2, 0xCC, 0x6B,
+                                                 3, 0xCD, 0x33, 0x33,
+                                                 2, 0xCE, 0x6C,
+                                                 2, 0xCF, 0x6D,
+                                                 2, 0xD0, 0x6E,
+                                                 2, 0xD1, 0x6F,
+                                                 3, 0xAB, 0x03, 0x67,
+                                                 3, 0xAC, 0x03, 0x6B,
+                                                 3, 0xAD, 0x03, 0x68,
+                                                 3, 0xAE, 0x03, 0x6C,
+                                                 2, 0xB3, 0x00,
+                                                 2, 0xB4, 0x00,
+                                                 2, 0xB5, 0x00,
+                                                 2, 0xB6, 0x32,
+                                                 2, 0xB7, 0x7E,
+                                                 2, 0xB8, 0x7E,
+                                                 2, 0xE0, 0x00,              // gamma settings ...
+                                                 3, 0xE1, 0x03, 0x0F,
+                                                 2, 0xE2, 0x04,
+                                                 2, 0xE3, 0x01,
+                                                 2, 0xE4, 0x0E,
+                                                 2, 0xE5, 0x01,
+                                                 2, 0xE6, 0x19,
+                                                 2, 0xE7, 0x10,
+                                                 2, 0xE8, 0x10,
+                                                 2, 0xEA, 0x12,
+                                                 2, 0xEB, 0xD0,
+                                                 2, 0xEC, 0x04,
+                                                 2, 0xED, 0x07,
+                                                 2, 0xEE, 0x07,
+                                                 2, 0xEF, 0x09,
+                                                 2, 0xF0, 0xD0,
+                                                 3, 0xF1, 0x0E, 0x17,        // (0x17 reproduces a stray data byte present in the vendor code)
+                                                 5, 0xF2, 0x2C, 0x1B, 0x0B, 0x20,
+                                                 2, 0xE9, 0x29,              // 1-dot inversion
+                                                 2, 0xEC, 0x04,
+                                                 2, 0x35, 0x00,              // TE (tearing effect) output on, v-blank pulse only
+                                                 3, 0x44, 0x00, 0x10,        // TE pulse at scanline 16
+                                                 2, 0x46, 0x10,              // (vendor TE-related setting)
+                                                 2, 0xFF, 0x00,              // back to the standard command page
+                                                 2, ILI9341_T4_PIXFMT, 0x05, // COLMOD: 16 bits per pixel (RGB565)
+                                                 2, ILI9341_T4_MADCTL, ILI9341_T4_MADCTL_VALUE, // row/column exchange: native landscape 428x142 (see ILI9341Driver.h)
+                                                 0 };
+
+        _print("\n\n------------ ILI9341_T4 (NV3007 port) begin() ------------\n\n");
+
+        // NV3007: the ER-TFT2.79-1 has no MISO/SDO line, so nothing can ever be
+        // read back from the display. Force miso=255: this makes every read
+        // dependent feature (vsync, scanline polling, status registers, XPT2046
+        // touch) disable itself through the library's existing MISO checks.
+        if (_miso != 255)
+            {
+            _print("*** WARNING: the NV3007 display has no MISO line: forcing miso=255 ***\n\n");
+            _miso = 255;
+            }
+
+        statsReset();
+        resync(); // resync at first upload
+        _mirrorfb = nullptr; // force full redraw.
+        _ongoingDiff = nullptr;
+
+        auto printPinBus = [this](const char* prefix, int pin, int bus)
+            {
+            _print(prefix);
+            _print(pin);
+            _print(" [SPI");
+            _print(bus);
+            _print("]\n");
+            };
+
+        auto printPin = [this](const char* prefix, int pin)
+            {
+            _print(prefix);
+            _print(pin);
+            _print('\n');
+            };
+
+        auto printMHz = [this](const char* prefix, uint32_t hz, const char* suffix)
+            {
+            _print(prefix);
+            _print(hz / 1000000);
+            _print('.');
+            const uint32_t frac = (hz % 1000000) / 10000;
+            if (frac < 10) _print('0');
+            _print(frac);
+            _print(suffix);
+            };
+
+        if (_touch_cs != 255)
+            { // set touch CS high to prevent interference.
+            digitalWrite(_touch_cs, HIGH);
+            pinMode(_touch_cs, OUTPUT);
+            digitalWrite(_touch_cs, HIGH);
+            }
+
+        if ((_miso == 255) && ((_touch_cs != 255) || (_touch_irq != 255)))
+            { // disable touch is there is no miso
+            _print("*** WARNING: Disabling the touchscreen because MISO_PIN = 255 ! ***\n\n ");
+            _touch_cs = 255;
+            _touch_irq = 255;
+            }
+        
+        if (_cs != 255)
+            { // set screen CS high also. 
+            digitalWrite(_cs, HIGH);
+            pinMode(_cs, OUTPUT);
+            digitalWrite(_cs, HIGH);
+            }
+        
+
+        // verify SPI pins are valid
+        int spinum_MOSI = -1; 
+        if (SPI.pinIsMOSI(_mosi)) spinum_MOSI = 0;  else if (SPI1.pinIsMOSI(_mosi)) spinum_MOSI = 1; else if (SPI2.pinIsMOSI(_mosi)) spinum_MOSI = 2;
+        if (spinum_MOSI < 0)
+            {
+            _print("\n*** ERROR: MOSI on pin ");
+            _print(_mosi);
+            _print(" is not a valid SPI pin ! ***\n\n");
+            return false;
+            }
+        else printPinBus("- MOSI on pin ", _mosi, spinum_MOSI);
+
+        int spinum_MISO = -1; 
+        if (_miso != 255)
+            {
+            if (SPI.pinIsMISO(_miso)) spinum_MISO = 0;  else if (SPI1.pinIsMISO(_miso)) spinum_MISO = 1; else if (SPI2.pinIsMISO(_miso)) spinum_MISO = 2;
+            if (spinum_MISO < 0)
+                {
+                _print("\n*** ERROR: MISO on pin ");
+                _print(_miso);
+                _print(" is not a valid SPI pin (or set PIN_MISO=255 if it is not connected to display) ! ***\n\n");
+                return false;
+                } 
+            else printPinBus("- MISO on pin ", _miso, spinum_MISO);
+            }
+        else
+            {
+            _print("- MISO not connected to display *** WARNING: VSync/Screen tearing protection is disabled *** !!!\n\n");
+            spinum_MISO = spinum_MOSI;
+            }
+
+        int spinum_SCK = -1; 
+        if (SPI.pinIsSCK(_sclk)) spinum_SCK = 0;  else if (SPI1.pinIsSCK(_sclk)) spinum_SCK = 1; else if (SPI2.pinIsSCK(_sclk)) spinum_SCK = 2;
+        if (spinum_SCK < 0)
+            {
+            _print("\n*** ERROR: SCK on pin ");
+            _print(_sclk);
+            _print(" is not a valid SPI pin ! ***\n\n");
+            return false;
+            }
+        else printPinBus("- SCK on pin ", _sclk, spinum_SCK);
+
+        if ((spinum_SCK != spinum_MISO) || (spinum_SCK != spinum_MOSI))
+            {
+            _print("\n*** ERROR: SCK, MISO and MOSI must be on the same SPI bus ! ***\n\n");
+            return false;
+            }
+
+        if (spinum_SCK == 0)
+            {
+            _pspi = &SPI;
+            _spi_num = 0; // Which buss is this spi on?
+            _pimxrt_spi = &IMXRT_LPSPI4_S;
+            _spi_hardware = &SPIClass::spiclass_lpspi4_hardware;
+            }
+        else if (spinum_SCK == 1)
+            {
+            _pspi = &SPI1;
+            _spi_num = 1; // Which buss is this spi on?
+            _pimxrt_spi = &IMXRT_LPSPI3_S;
+            _spi_hardware = &SPIClass::spiclass_lpspi3_hardware;
+            }
+        else 
+            {
+            _pspi = &SPI2;
+            _spi_num = 2; // Which buss is this spi on?
+            _pimxrt_spi = &IMXRT_LPSPI1_S;
+            _spi_hardware = &SPIClass::spiclass_lpspi1_hardware;
+            }
+
+        // Make sure we have all of the proper SPI pins selected.
+        _pspi->setMOSI(_mosi);
+        _pspi->setSCK(_sclk);
+        if (_miso != 255) _pspi->setMISO(_miso);
+
+        //
+        // the next lines replace the command:  _pspi->begin();
+        // but it does not affects the MISO pin (if unused).      
+        // 
+        if (_miso != 255)
+            {
+            _pspi->begin();
+            }
+        else
+            {
+            // same as _pspi->begin() but without setting miso                        
+            int mosi_pin_index = 0;
+            for (unsigned int i = 0; i < sizeof(_spi_hardware->mosi_pin); i++)
+                {
+                if (_mosi == _spi_hardware->mosi_pin[i]) { mosi_pin_index = i; break; }
+                }
+            int sck_pin_index = 0;
+            for (unsigned int i = 0; i < sizeof(_spi_hardware->sck_pin); i++)
+                {
+                if (_sclk == _spi_hardware->sck_pin[i]) { sck_pin_index = i; break; }
+                }
+
+            _spi_hardware->clock_gate_register &= ~_spi_hardware->clock_gate_mask;
+            CCM_CBCMR = (CCM_CBCMR & ~(CCM_CBCMR_LPSPI_PODF_MASK | CCM_CBCMR_LPSPI_CLK_SEL_MASK)) | CCM_CBCMR_LPSPI_PODF(2) | CCM_CBCMR_LPSPI_CLK_SEL(1); // pg 714
+            uint32_t fastio = IOMUXC_PAD_DSE(7) | IOMUXC_PAD_SPEED(2);
+
+            //*(portControlRegister(_spi_hardware->miso_pin[miso_pin_index])) = fastio;
+            *(portControlRegister(_spi_hardware->mosi_pin[mosi_pin_index])) = fastio;
+            *(portControlRegister(_spi_hardware->sck_pin[sck_pin_index])) = fastio;
+
+            _spi_hardware->clock_gate_register |= _spi_hardware->clock_gate_mask;
+            // *(portConfigRegister(_spi_hardware->miso_pin[miso_pin_index])) = _spi_hardware->miso_mux[miso_pin_index];
+            *(portConfigRegister(_spi_hardware->mosi_pin[mosi_pin_index])) = _spi_hardware->mosi_mux[mosi_pin_index];
+            *(portConfigRegister(_spi_hardware->sck_pin[sck_pin_index])) = _spi_hardware->sck_mux[sck_pin_index];
+
+            _spi_hardware->sck_select_input_register = _spi_hardware->sck_select_val[sck_pin_index];
+            // _spi_hardware->miso_select_input_register = _spi_hardware->miso_select_val[miso_pin_index];
+            _spi_hardware->mosi_select_input_register = _spi_hardware->mosi_select_val[mosi_pin_index];
+
+            _pimxrt_spi->CR = LPSPI_CR_RST;
+            _pimxrt_spi->FCR = LPSPI_FCR_TXWATER(15);
+
+            _pspi->beginTransaction(SPISettings());
+            _pspi->endTransaction();
+            }
+
+        _pending_rx_count = 0; // Make sure it is zero if we we do a second begin...
+
+        // CS pin direct access via port.
+        if (_cs < 255)
+            {
+            printPin("- CS on pin ", _cs);
+            _csport = portOutputRegister(_cs);
+            _cspinmask = digitalPinToBitMask(_cs);
+            pinMode(_cs, OUTPUT);
+            _directWriteHigh(_csport, _cspinmask);
+            }
+        else
+            {
+            _print("- CS not connected to the Teensy (make sure CS is pulled down on the ILI9341 side...)\n");
+            _csport = NULL; 
+            }
+
+        _spi_tcr_current = _pimxrt_spi->TCR; // get the current TCR value
+
+        if (_dc == 255)
+            {
+            _print("\n*** ERROR: DC pin cannot be left unconnected ! ***\n\n");
+            return false;
+            }
+
+        _hardware_dc = _pspi->pinIsChipSelect(_dc);
+
+        if (_hardware_dc)
+            {
+            if (!_pspi->pinIsChipSelect(_dc))
+                {
+                _print("\n*** ERROR: DC (here on pin ");
+                _print(_dc);
+                _print(") is not a valid cs pin for SPI");
+                _print(_spi_num);
+                _print(" ***\n\n");
+                return false; // ERROR, DC is not a hardware CS pin for the SPI bus. 
+                }
+            _print("- DC on pin ");
+            _print(_dc);
+            _print(" [SPI");
+            _print(_spi_num);
+            _print("] Hardware accelerated !\n");
+            uint8_t dc_cs_index = _pspi->setCS(_dc);
+            dc_cs_index--; // convert to 0 based
+            _tcr_dc_assert = LPSPI_TCR_PCS(dc_cs_index);              
+            _tcr_dc_not_assert = LPSPI_TCR_PCS(3);            
+            }
+        else
+            {                                 
+            _print("- DC on pin ");
+            _print(_dc);
+            _print("  >>>> *** No hardware acceleration : put DC on a hardware chip select pin for speedup *** \n");
+            _tcr_dc_assert = LPSPI_TCR_PCS(1);
+            _tcr_dc_not_assert = LPSPI_TCR_PCS(3);                                  
+            _dcport = portOutputRegister(_dc);
+            _dcpinmask = digitalPinToBitMask(_dc);
+            pinMode(_dc, OUTPUT);
+            _directWriteHigh(_dcport, _dcpinmask);
+            }           
+
+        // attach interrupt            
+        switch (_spi_num)
+            {
+            case 0:
+                attachInterruptVector(IRQ_LPSPI4, (_hardware_dc) ? _spiInterruptSPI0_hardware : _spiInterruptSPI0_software);
+                break;
+            case 1:
+                attachInterruptVector(IRQ_LPSPI3, (_hardware_dc) ? _spiInterruptSPI1_hardware : _spiInterruptSPI1_software);
+                break;
+            case 2:
+                attachInterruptVector(IRQ_LPSPI1, (_hardware_dc) ? _spiInterruptSPI2_hardware : _spiInterruptSPI2_software);
+                break;
+            }
+
+        setIRQPriority(_irq_priority); // set SPI interrupt priority
+
+        _maybeUpdateTCR(_tcr_dc_not_assert | LPSPI_TCR_FRAMESZ(7)); // drive DC high now. 
+
+        if (_rst < 255) printPin("- RST on pin ", _rst); else _print("- RST pin not connected (set it to +3.3V).\n");
+        if (_touch_cs < 255)
+            {
+            _print("\n[Touchscreen is CONNECTED]\n");
+            printPin("- TOUCH_CS on pin ", _touch_cs);
+            if (_touch_irq < 255) printPin("- TOUCH_IRQ on pin ", _touch_irq); else _print("- TOUCH_IRQ not connected\n");
+            }
+        else
+            {
+            _print("\n[Touchscreen NOT connected]\n");
+            }
+
+        _spi_clock = spi_clock;
+        if (_spi_clock < 0) _spi_clock = ILI9341_T4_DEFAULT_SPICLOCK;
+        _spi_clock_read = spi_clock_read;
+        if (_spi_clock_read < 0) _spi_clock_read = ILI9341_T4_DEFAULT_SPICLOCK_READ;
+        printMHz("\n- SPI write speed : ", _spi_clock, "Mhz\n");
+        printMHz("- SPI read speed : ", _spi_clock_read, "Mhz\n\n");
+        _print("- IRQ priority : ");
+        _print(_irq_priority);
+        _print("\n\n");
+
+        _rotation = 0; // default rotation
+
+        int r = ILI9341_T4_RETRY_INIT;
+        while(1)
+            { // sometimes, init may fail because of instable power supply. Retry in this case.         
+            if (_rst < 255)
+                { // Reset the screen
+                pinMode(_rst, OUTPUT);
+                digitalWrite(_rst, HIGH);
+                delay(10);
+                digitalWrite(_rst, LOW);
+                delay(20);
+                digitalWrite(_rst, HIGH);
+                }
+            else
+                {
+                // NV3007: the software reset command (0x01) is not documented in the
+                // NV3007 datasheet so this fallback may not work: wire up the RST pin !
+                _print("*** WARNING: no RST pin: trying software reset, unverified on NV3007 ***\n");
+                _beginSPITransaction(_spi_clock / 4); // quarter speed for setup !
+                for(int i=0; i<5; i++) _writecommand_cont(ILI9341_T4_NOP); // send NOPs
+                _writecommand_last(ILI9341_T4_SWRESET); // issue a software reset
+                _endSPITransaction();
+                }
+            delay(150); // mandatory !
+           
+            _beginSPITransaction(_spi_clock / 4); // quarter speed for setup ! 
+            const uint8_t* addr = init_commands;
+            while (1)
+                {
+                uint8_t count = *addr++;
+                if (count-- == 0) break;
+                _writecommand_cont(*addr++);
+                while (count-- > 0) { _writedata8_cont(*addr++); }
+                }
+            _writecommand_last(ILI9341_T4_SLPOUT); // Exit Sleep            
+            _endSPITransaction();
+
+            delay(150); // must wait for the screen to exit sleep mode. 
+            _beginSPITransaction(_spi_clock / 4); // quarter speed for setup ! 
+            _writecommand_last(ILI9341_T4_DISPON); // Display on
+            _endSPITransaction();
+                     
+            // NV3007: without a MISO line there is no way to read the display's
+            // status registers, so initialization cannot be verified: begin()
+            // always reports success. If the screen stays dark, check the wiring
+            // (in particular CS/DC swapped) and the RST pin.
+            bool ok = true;
+            _print("\nNo MISO line on the NV3007: the screen status cannot be verified.\n");
+            if (ok)
+                {
+                // all good, ready to warp pixels :-)
+                // ok, we can talk to the display so we set the (max) refresh rate to read its exact values
+                setRefreshMode(0);
+                _period_mode0 = _period; // save the period for fastest mode. 
+                _print("\nOK. Screen initialization successful !\n\n");
+                return true;
+                }
+            // error
+            if (--r <= 0)
+                {
+                _print("\n*** CANNOT CONNECT TO ILI9341 SCREEN. ABORTING... ***\n\n");
+                return false; 
+                }
+            if (_spi_clock_read > 100000)_spi_clock_read /= 2;
+            printMHz("Retrying connexion with slower SPI read speed : ", _spi_clock_read, "Mhz");
+            delay(1000);
+            }
+        }
+
+
+    FLASHMEM int ILI9341Driver::selfDiagStatus()
+        {
+        _waitUpdateAsyncComplete();
+        resync();
+        if (_miso == 255) return 0; // return 0 
+        return _readcommand8(ILI9341_T4_RDSELFDIAG);
+        }
+
+
+    FLASHMEM void ILI9341Driver::printStatus()
+        {
+        _waitUpdateAsyncComplete();
+        _print("---------------- ILI9341Driver Status-----------------\n");
+        if (_miso == 255)
+            {
+            _print("\n*** MISO pin not connected to display: screen status cannot be queried ***\n\n");
+            }
+        else
+            {
+            uint8_t x = _readcommand8(ILI9341_T4_RDMODE);
+            _print("- Display Power Mode  : 0x"); _println(x, HEX);
+            x = _readcommand8(ILI9341_T4_RDMADCTL);
+            _print("- MADCTL Mode         : 0x"); _println(x, HEX);
+            x = _readcommand8(ILI9341_T4_RDPIXFMT);
+            _print("- Pixel Format        : 0x"); _println(x, HEX);
+            x = _readcommand8(ILI9341_T4_RDIMGFMT);
+            _print("- Image Format        : 0x"); _println(x, HEX);
+            x = _readcommand8(ILI9341_T4_RDSGNMODE);
+            _print("- Display Signal Mode : 0x"); _println(x, HEX);
+            x = _readcommand8(ILI9341_T4_RDSELFDIAG);
+            _print("- Self Diagnostic     : 0x"); _print(x, HEX);
+            if (x == ILI9341_T4_SELFDIAG_OK) _println(" [OK].\n"); else _println(" [ERROR].\n");
+            }
+        resync();
+        }
+
+
+    FLASHMEM void ILI9341Driver::setSpiClock(int spi_clock)
+        {
+        _waitUpdateAsyncComplete();
+        _spi_clock = spi_clock;
+        statsReset();
+        resync();
+        };
+
+
+    FLASHMEM void ILI9341Driver::setSpiClockRead(int spi_clock)
+        {
+        _waitUpdateAsyncComplete();
+        _spi_clock_read = spi_clock;
+        statsReset();
+        resync();
+        }
+
+
+    FLASHMEM void ILI9341Driver::setIRQPriority(int irq_priority)
+        {
+        _waitUpdateAsyncComplete();            
+        noInterrupts();
+        _irq_priority = _clip(irq_priority, 0, 255);        
+        switch (_spi_num)
+            {
+            case 0:
+                NVIC_SET_PRIORITY(IRQ_LPSPI4, _irq_priority);
+                NVIC_ENABLE_IRQ(IRQ_LPSPI4);
+                break;
+            case 1:
+                NVIC_SET_PRIORITY(IRQ_LPSPI3, _irq_priority);
+                NVIC_ENABLE_IRQ(IRQ_LPSPI3);
+                break;
+            case 2:
+                NVIC_SET_PRIORITY(IRQ_LPSPI1, _irq_priority);
+                NVIC_ENABLE_IRQ(IRQ_LPSPI1);
+                break;
+            }        
+        interrupts();
+        }
+
+
+    /**********************************************************************************************************
+    * Misc. commands.
+    ***********************************************************************************************************/
+
+
+
+    FLASHMEM void ILI9341Driver::sleep(bool enable)
+        {
+        _waitUpdateAsyncComplete();
+
+        _mirrorfb = nullptr; // force full redraw.
+        _ongoingDiff = nullptr;
+
+        _beginSPITransaction(_spi_clock / 4); // quarter speed
+        if (enable)
+            {
+            _writecommand_cont(ILI9341_T4_DISPOFF);
+            _writecommand_last(ILI9341_T4_SLPIN);
+            _endSPITransaction();
+            delay(200);
+            }
+        else
+            {
+            _writecommand_cont(ILI9341_T4_DISPON);
+            _writecommand_last(ILI9341_T4_SLPOUT);
+            _endSPITransaction();
+            delay(20);
+            }
+        resync();
+        }
+
+
+
+    FLASHMEM void ILI9341Driver::invertDisplay(bool i)
+        {
+        _waitUpdateAsyncComplete();
+        _beginSPITransaction(_spi_clock / 4); // quarter speed
+        _writecommand_last(i ? ILI9341_T4_INVON : ILI9341_T4_INVOFF);
+        _endSPITransaction();
+        resync();
+        }
+
+
+    FLASHMEM void ILI9341Driver::setScroll(int offset)
+        {
+        // NV3007: hardware scrolling is disabled on this port. The controller's
+        // vertical-scroll feature moves pixels along its physical 428-row axis,
+        // but since we run with row/column exchange (MADCTL MV bit) that axis is
+        // the driver's X axis, so the library's 'scroll framebuffer lines'
+        // semantic cannot be implemented with it. Scroll in software instead by
+        // drawing at an offset in the framebuffer (the diff will handle it).
+        (void)offset; // unused
+        _print("*** WARNING: setScroll() is not supported on the NV3007 port (does nothing) ***\n");
+        }
+
+
+
+    /**********************************************************************************************************
+    * Screen orientation
+    ***********************************************************************************************************/
+
+
+    FLASHMEM void ILI9341Driver::setRotation(uint8_t m)
+        {
+        m = _clip(m, (uint8_t)0, (uint8_t)3);
+        if (m == _rotation) return;
+        _waitUpdateAsyncComplete();
+        _mirrorfb = nullptr; // force full redraw.
+        _ongoingDiff = nullptr;
+
+        statsReset();
+        _rotation = m;
+        switch (m)
+            {
+            case 0: // landscape 428x142 (native)
+            case 2: // landscape 428x142 flipped
+                _width = ILI9341_T4_TFTWIDTH;
+                _height = ILI9341_T4_TFTHEIGHT;
+                break;
+            case 1: // portrait 142x428
+            case 3: // portrait 142x428 flipped
+                _width = ILI9341_T4_TFTHEIGHT;
+                _height = ILI9341_T4_TFTWIDTH;
+                break;
+            }
+        resync();
+        }
+
+
+
+
+    /**********************************************************************************************************
+    * About timing and vsync.
+    ***********************************************************************************************************/
+
+
+    FLASHMEM void ILI9341Driver::setRefreshMode(int mode)
+        {
+        // NV3007: the ILI9341 frame-rate register (FRMCTR1 = 0xB1) does not exist
+        // on this controller so no command is sent to the display: the refresh
+        // rate stays at the panel's power-on default (~60Hz). The bookkeeping
+        // below is kept so that _period gets a sane value for the internal timers.
+        if ((mode < 0) || (mode > 31)) return; // invalid mode, do nothing.
+        _refreshmode = mode;
+        _waitUpdateAsyncComplete();
+        _sampleRefreshRate(); // set _period from the (assumed) refresh rate
+        statsReset();
+        resync();
+        }
+
+
+    FLASHMEM void ILI9341Driver::setRefreshRate(float refreshrate_hz)
+        {
+        const int m = _modeForRefreshRate(refreshrate_hz);
+        setRefreshMode(m);
+        resync();
+        }
+
+
+    FLASHMEM void ILI9341Driver::printRefreshMode()
+        {
+        const int om = getRefreshMode();
+        _print("------------ ILI9341Driver Refresh Modes -------------\n");
+        if (_miso == 255)
+            {
+            _print("*** WARNING The values displayed below are 'typical values' because exact rates cannot be queried since PIN_MISO=255 ***\n");
+            }
+        for(int m = 0; m <= 31; m++)
+            {
+            setRefreshMode(m);
+            float r = getRefreshRate();
+            _print("- mode ");
+            _print((uint32_t)m);
+            _print(" : ");
+            if (_outputStream) _outputStream->print(r, 2);
+            _print("Hz");
+            if (_miso != 255)
+                {
+                _print(" (");
+                _print((uint32_t)round(r / 2));
+                _print(" FPS with vsync_spacing = 2).");
+                }
+            _print("\n");
+            }
+        _println("");
+        setRefreshMode(om);
+        }
+
+
+    /** return the current scanline in [0, 319]. Sync with SPI only if required */
+    FLASHMEM int ILI9341Driver::_getScanLine(bool sync)
+        {
+        if (_miso == 255) { _print("***  WARNING: _getScanLine called while MISO_PIN=255 ***\n"); }
+
+        if ((!sync)||(_miso==255))
+            {
+            if (_period == 0) return _synced_scanline;
+            return ( _synced_scanline + ((((uint64_t)_synced_em)* ILI9341_T4_NB_SCANLINES) / _period) ) % ILI9341_T4_NB_SCANLINES;
+            }
+
+        const auto estimatedScanline = [&]() -> int
+            {
+            if (_period == 0) return _synced_scanline;
+            return ( _synced_scanline + ((((uint64_t)_synced_em)* ILI9341_T4_NB_SCANLINES) / _period) ) % ILI9341_T4_NB_SCANLINES;
+            };
+
+        const auto timeoutScanlineRead = [&]() -> int
+            {
+            _print("***  WARNING: timeout in ILI9341Driver::_getScanLine(); using estimated scanline ***\n");
+            _pimxrt_spi->CR = LPSPI_CR_MEN | LPSPI_CR_RRF | LPSPI_CR_RTF;
+            _endSPITransaction();
+            return estimatedScanline();
+            };
+        static constexpr uint32_t SCANLINE_READ_TIMEOUT_US = 1000;
+        elapsedMicros em = 0;
+
+        _beginSPITransaction(_spi_clock_read);
+
+        _maybeUpdateTCR(_tcr_dc_assert | LPSPI_TCR_FRAMESZ(7));
+        _pimxrt_spi->TDR = ILI9341_T4_GSLINE; // send command
+        _pimxrt_spi->TCR = _spi_tcr_current;
+        while ((_pimxrt_spi->FSR & 0x1f)) // make sure command has been sent
+            {
+            if (em > SCANLINE_READ_TIMEOUT_US) return timeoutScanlineRead();
+            }
+        delayMicroseconds(3); // wait as requeted per manual
+
+        uint32_t val = 0; 
+
+        while ((_pimxrt_spi->RSR & LPSPI_RSR_RXEMPTY) != 0)
+            {
+            if (em > SCANLINE_READ_TIMEOUT_US) return timeoutScanlineRead();
+            }
+        val = _pimxrt_spi->RDR; // Read pending RX bytes
+
+        _maybeUpdateTCR(_tcr_dc_not_assert | LPSPI_TCR_FRAMESZ(7));
+        _pimxrt_spi->TDR = 0;
+
+        while ((_pimxrt_spi->RSR & LPSPI_RSR_RXEMPTY) != 0)
+            {
+            if (em > SCANLINE_READ_TIMEOUT_US) return timeoutScanlineRead();
+            }
+        val = _pimxrt_spi->RDR; // Read pending RX bytes
+       
+        _maybeUpdateTCR(_tcr_dc_not_assert | LPSPI_TCR_FRAMESZ(8)); // AHAH, the value is 9 bits ! lol...
+        _pimxrt_spi->TDR = 0;
+
+        while ((_pimxrt_spi->RSR & LPSPI_RSR_RXEMPTY) != 0)
+            {
+            if (em > SCANLINE_READ_TIMEOUT_US) return timeoutScanlineRead();
+            }
+        val = _pimxrt_spi->RDR; // Read pending RX bytes
+
+        _synced_em = 0;
+        _synced_scanline = (val > ILI9341_T4_TFTHEIGHT - 1) ? 0 : val;  // save the scanline
+
+        _endSPITransaction();
+        return _synced_scanline;
+        }
+
+
+    FLASHMEM void ILI9341Driver::_sampleRefreshRate()
+        {
+        const auto setApproximateRefreshRate = [&]()
+            {
+            _period = (uint32_t)round(1000000.0f / ILI9341_T4_refresh_rates[_refreshmode]);
+            };
+
+        const auto useApproximateRefreshRateAfterTimeout = [&]()
+            {
+            setApproximateRefreshRate();
+            _println("***  WARNING: timeout in ILI9341Driver::_sampleRefreshRate(); using approximate refresh rate ***");
+            };
+
+        if (_miso == 255)
+            { // hack when MISO line not connected: approximate...
+            setApproximateRefreshRate();
+            return;
+            }
+
+        const int NB_SAMPLE_FRAMES = 10;
+        static constexpr uint32_t SAMPLE_REFRESH_WAIT_TIMEOUT_US = 250000;
+
+        const auto waitScanlineZero = [&]() -> bool
+            {
+            elapsedMicros wait_em = 0;
+            while (_getScanLine(true) != 0)
+                {
+                if (wait_em > SAMPLE_REFRESH_WAIT_TIMEOUT_US) return false;
+                }
+            return true;
+            };
+
+        const auto waitScanlineNotZero = [&]() -> bool
+            {
+            elapsedMicros wait_em = 0;
+            while (_getScanLine(true) == 0)
+                {
+                if (wait_em > SAMPLE_REFRESH_WAIT_TIMEOUT_US) return false;
+                }
+            return true;
+            };
+
+        elapsedMicros em = 0; // start counter 
+
+        // wait to reach scanline 0
+        if (!waitScanlineZero())
+            {
+            useApproximateRefreshRateAfterTimeout();
+            return;
+            }
+
+        if (!waitScanlineNotZero())
+            {
+            useApproximateRefreshRateAfterTimeout();
+            return;
+            }
+
+        // ok, just start at scanline 1. 
+        em = 0;
+        for (int i = 0; i < NB_SAMPLE_FRAMES; i++)
+            {
+            delayMicroseconds(5000); // must be less than 200 FPS so wait at least 5ms
+            // wait to reach scanline 0
+            if (!waitScanlineZero())
+                {
+                useApproximateRefreshRateAfterTimeout();
+                return;
+                }
+            // wait to begin scanline 1. 
+            if (!waitScanlineNotZero())
+                {
+                useApproximateRefreshRateAfterTimeout();
+                return;
+                }
+            }
+        _period = (uint32_t)round(((float)em) / NB_SAMPLE_FRAMES);
+        }
+
+
+    FLASHMEM float ILI9341Driver::_refreshRateForMode(int mode) const
+        { 
+        float freq = 1000000.0f / _period_mode0;
+        if (mode >= 16)
+            {
+            freq /= 2.0f; 
+            mode -= 16;
+            }
+        return (freq*16.0f)/(16.0f + mode);
+        }
+
+
+    FLASHMEM int ILI9341Driver::_modeForRefreshRate(float hz) const
+        {
+        if (hz <= _refreshRateForMode(31)) return 31;
+        if (hz >= _refreshRateForMode(0)) return 0;
+        int a = 0;
+        int b = 31;
+        while (b - a > 1)
+            { // dichotomy. 
+            int c = (a + b) / 2;
+            ((hz < _refreshRateForMode(c)) ? a : b) = c;
+            }
+        float da = _refreshRateForMode(a) - hz;
+        float db = hz - _refreshRateForMode(b);
+        return (da < db ? a : b);
+        }
+
+
+
+    /**********************************************************************************************************
+    * VSync spacing
+    ***********************************************************************************************************/
+
+
+    FLASHMEM void ILI9341Driver::setVSyncSpacing(int vsync_spacing)
+        {
+        if (_miso == 255)
+            {
+            if (vsync_spacing > 0)
+                {// cannot use vsync if MISO line not set. 
+                _print("*** WARNING: setVSyncSpacing(");
+                _print(vsync_spacing);
+                _print(") called while PIN_MISO=255, reverting to vsync_spacing = 0 ***\n");
+                vsync_spacing = 0; 
+                }
+            }
+        _waitUpdateAsyncComplete();
+        _vsync_spacing = ILI9341Driver::_clip<int>((int)vsync_spacing, (int)-1, (int)ILI9341_T4_MAX_VSYNC_SPACING);
+        statsReset();
+        resync();
+        }
+
+
+    FLASHMEM void ILI9341Driver::setLateStartRatio(float ratio)
+        {
+        _waitUpdateAsyncComplete(); // no need to wait for sync. 
+        _late_start_ratio = ILI9341Driver::_clip<float>(ratio, 0.1f, 0.9f);
+        statsReset();
+        resync();
+        }
+
+
+    /**********************************************************************************************************
+    * Buffering mode
+    ***********************************************************************************************************/
+
+
+
+    FLASHMEM void ILI9341Driver::setFramebuffer(uint16_t* fb1)
+        {
+        _waitUpdateAsyncComplete();
+        _mirrorfb = nullptr; // complete redraw needed.
+        _ongoingDiff = nullptr;
+        _fb1 = fb1;        
+        if (_fb1) memset(_fb1, 0, ILI9341_T4_NB_PIXELS*2);   
+        resync();
+        }
+
+
+
+
+    /**********************************************************************************************************
+    * Differential updates
+    ***********************************************************************************************************/
+
+
+    FLASHMEM void ILI9341Driver::setDiffBuffers(DiffBuffBase* diff1, DiffBuffBase* diff2)
+        {
+        _waitUpdateAsyncComplete();
+        if (diff1)
+            {
+            _diff1 = diff1;
+            _diff2 = diff2;
+            }
+        else
+            {
+            _diff1 = diff2;
+            _diff2 = diff1;
+            }
+        statsReset();
+        resync();
+        }
+
+
+    FLASHMEM void ILI9341Driver::setDiffGap(int gap)
+        {
+        _waitUpdateAsyncComplete();
+        _diff_gap = ILI9341Driver::_clip<int>((int)gap, (int)2, (int)ILI9341_T4_NB_PIXELS);
+        statsReset();
+        resync();
+        }
+
+
+    FLASHMEM void ILI9341Driver::setDiffCompareMask(uint16_t mask)
+        {
+        if (mask == 65535) mask = 0;
+        _compare_mask = mask;
+        }
+
+
+    FLASHMEM void ILI9341Driver::setDiffCompareMask(int bitskip_red, int bitskip_green, int bitskip_blue)
+        {
+        bitskip_red = ILI9341Driver::_clip<int>(bitskip_red, 0, 5);
+        bitskip_green = ILI9341Driver::_clip<int>(bitskip_green, 0, 6);
+        bitskip_blue = ILI9341Driver::_clip<int>(bitskip_blue, 0, 5);
+        _compare_mask = (((uint16_t)(((0xFF >> bitskip_red) << bitskip_red) & 31)) << 11)
+                      | (((uint16_t)(((0xFF >> bitskip_green) << bitskip_green) & 63)) << 5)
+                      | ((uint16_t)(((0xFF >> bitskip_blue) << bitskip_blue) & 31));
+        if (_compare_mask == 65535) _compare_mask = 0; 
+        }
+
+
+    /**********************************************************************************************************
+    * Update
+    ***********************************************************************************************************/
+
+
+    FLASHMEM void ILI9341Driver::setAsyncUpdateCB(void (*callback)(void *), void * userdata)
+        {
+        noInterrupts();
+        _dmaCB = callback;
+        _dmaCBdata = userdata;
+        interrupts();
+        }
+
+
+
+    FLASHMEM void ILI9341Driver::clear(uint16_t color)
+        {
+        _waitUpdateAsyncComplete();    
+        _beginSPITransaction(_spi_clock);
+        _writecommand_cont(ILI9341_T4_PASET);
+        _writedata16_cont(ILI9341_T4_YOFFSET);                              // NV3007: shift into the visible GRAM window
+        _writedata16_cont(ILI9341_T4_TFTHEIGHT-1 + ILI9341_T4_YOFFSET);
+        _writecommand_cont(ILI9341_T4_CASET);
+        _writedata16_cont(ILI9341_T4_XOFFSET);
+        _writedata16_cont(ILI9341_T4_TFTWIDTH-1 + ILI9341_T4_XOFFSET);
+        _writecommand_cont(ILI9341_T4_RAMWR);
+        for(int i=0; i < ILI9341_T4_NB_PIXELS; i++) _writedata16_cont(color);           
+        _writecommand_last(ILI9341_T4_NOP); 
+        _endSPITransaction();            
+        if (_fb1)
+            {
+            for(int i=0; i < ILI9341_T4_NB_PIXELS; i++) _fb1[i] = color;
+            _mirrorfb = _fb1;
+            _ongoingDiff = nullptr;
+            }
+        resync();
+        }
+
+
+    FLASHMEM void ILI9341Driver::updateRegion(bool redrawNow, const uint16_t* fb, int xmin, int xmax, int ymin, int ymax, int stride)
+        {
+        if (fb == nullptr) return;
+        if ((xmin > xmax) || (ymin > ymax)) return;
+        if ((xmin < 0) || (ymin < 0) || (xmax >= _width) || (ymax >= _height)) return;
+        if (stride < 0) stride = xmax - xmin + 1;
+        if (stride <= 0) return;
+        switch (bufferingMode())
+            {
+            case NO_BUFFERING:
+                // the only thing we can do is to push the sub-frame right away. 
+                // without DMA and without DIFF so we just upload the rectangle. 
+                // TODO : add vsync ? 
+                _mirrorfb = nullptr; 
+                _ongoingDiff = nullptr;
+                _updateRectNow(fb, xmin, xmax, ymin, ymax, stride);
+                return;
+
+            default:
+                // DOUBLE_BUFFERING                 
+                if (_diff2 == nullptr) // differential updates only with 2 diffs buffers.  
+                    { // NO DIFFERENTIAL UPDATES: copy into the framebuffer and update the screen if required                    
+                    _ongoingDiff = nullptr;    // no diff
+                    _waitUpdateAsyncComplete(); // wait if there is still an update in progress                                 
+                    _dummydiff1->computeDiff(_fb1, nullptr, fb, xmin, xmax, ymin, ymax, stride, _rotation, _diff_gap, true, _compare_mask); // create a diff and copy to fb1.
+                    if (redrawNow) 
+                        {
+                        bool update_ok = true;
+                        if (_mirrorfb)
+                            { // _fb1 mirrors the screen so we just need to draw the region 
+                            _updateRectNow(fb, xmin, xmax, ymin, ymax, stride); // note that we can use the method with fb and not _fb1. ***** TODO: replace by an async draw
+                            }
+                        else
+                            { // redraw everything, via DMA
+                            _flush_cache(_fb1, ILI9341_T4_NB_PIXELS * 2);
+                            update_ok = _updateAsync(_fb1, _dummydiff1); // launch update
+                            }
+                        _mirrorfb = update_ok ? _fb1 : nullptr;
+                        }
+                    else
+                        {
+                        _mirrorfb = nullptr;                         
+                        }
+                    return;
+                    }
+
+                // we have 2 diff buffers and a framebuffer.                 
+                if (_mirrorfb)
+                    { // the framebuffer mirrors the screen                
+                    if (asyncUpdateActive())
+                        {
+                        _diff2->computeDiff(_fb1, nullptr, fb, xmin, xmax, ymin, ymax, stride, _rotation, _diff_gap, false, _compare_mask); // create diff while async update
+                        _waitUpdateAsyncComplete();
+                        DiffBuffBase::copyfb(_fb1, fb, xmin, xmax, ymin, ymax, stride, _rotation); // copy to fb1
+                        }
+                    else
+                        {
+                        _diff2->computeDiff(_fb1, nullptr, fb, xmin, xmax, ymin, ymax, stride, _rotation, _diff_gap, true, _compare_mask); // create a diff and copy to fb1.
+                        }
+                    _swapdiff();
+                    if (redrawNow)
+                        {
+                        _flush_cache(_fb1, ILI9341_T4_NB_PIXELS * 2);
+                        const bool update_ok = _updateAsync(_fb1, _diff1);
+                        _mirrorfb = update_ok ? _fb1 : nullptr;
+                        _ongoingDiff = nullptr;
+                        }
+                    else
+                        {
+                        _mirrorfb = nullptr; 
+                        _ongoingDiff = _diff1;
+                        }
+                    return;
+                    }
+
+                if (_ongoingDiff != nullptr)
+                    { // we are "in advance" w.r.t the screen
+                    if (asyncUpdateActive())
+                        {
+                        _diff2->computeDiff(_fb1, _diff1, fb, xmin, xmax, ymin, ymax, stride, _rotation, _diff_gap, false, _compare_mask); // create diff while asyn update
+                        _waitUpdateAsyncComplete();
+                        DiffBuffBase::copyfb(_fb1, fb, xmin, xmax, ymin, ymax, stride, _rotation); // copy to fb1
+                        }
+                    else
+                        {
+                        _diff2->computeDiff(_fb1, _diff1, fb, xmin, xmax, ymin, ymax, stride, _rotation, _diff_gap, true, _compare_mask); // create a diff and copy to fb1.
+                        }
+                    _swapdiff();
+                    if (redrawNow)
+                        {
+                        _flush_cache(_fb1, ILI9341_T4_NB_PIXELS * 2);
+                        const bool update_ok = _updateAsync(_fb1, _diff1);
+                        _mirrorfb = update_ok ? _fb1 : nullptr;
+                        _ongoingDiff = nullptr;
+                        }
+                    else
+                        {
+                        _mirrorfb = nullptr; 
+                        _ongoingDiff = _diff1;
+                        }
+                    return;
+                    }
+
+                // here, the framebuffer does not mirror the screen 
+                _waitUpdateAsyncComplete();
+                DiffBuffBase::copyfb(_fb1, fb, xmin, xmax, ymin, ymax, stride, _rotation); // copy the region into to fb1
+                if (redrawNow)
+                    { // redraw everything
+                    _dummydiff1->computeDiff(_fb1, fb, _rotation, _diff_gap, false, _compare_mask); // create a dummy diff
+                    _flush_cache(_fb1, ILI9341_T4_NB_PIXELS * 2);
+                    _mirrorfb = _updateAsync(_fb1, _dummydiff1) ? _fb1 : nullptr; // now we mirror the screen if the update was accepted.
+                    }
+                return;
+                
+            }
+        }
+        
+
+
+    FLASHMEM void ILI9341Driver::update(const uint16_t* fb, bool force_full_redraw)
+        {
+         
+        
+        if (fb == nullptr) return;
+
+        if (fb == _fb1)
+            { // ahah, someone is trying to cheat but I caught you !
+            force_full_redraw = true; // a diff with itself would result in nothing to draw !
+            }
+
+        _ongoingDiff = nullptr; // here we just ignore possible ongoing diff and just redraw everything if _mirrorfb == nullptr. 
+                                // We could do better but don't care since its an edge case relevant only when swapping between 
+                                // methods updateRegion() and  update() which are not usually mixed. 
+
+        switch (bufferingMode())
+            {
+            case NO_BUFFERING:
+                {
+                _waitUpdateAsyncComplete(); // wait until update is done (normally useless but still).                 
+                _mirrorfb = nullptr;
+                _dummydiff1->computeDummyDiff(); 
+                _updateNow(fb, _dummydiff1);
+                return;
+                }
+
+            case DOUBLE_BUFFERING:
+                {                
+                if ((_vsync_spacing == -1) && (asyncUpdateActive())) { return; } // just drop the frame. 
+
+                if ((_diff1 == nullptr)|| (_mirrorfb == nullptr) || (force_full_redraw))
+                    { // do not use differential update
+                    _waitUpdateAsyncComplete(); // wait until update is done. 
+                    _dummydiff1->computeDiff(_fb1, fb, getRotation(), _diff_gap, true, _compare_mask); // create a dummy diff and copy to fb1. 
+                    _flush_cache(_fb1, ILI9341_T4_NB_PIXELS * 2);
+                    _mirrorfb = _updateAsync(_fb1, _dummydiff1) ? _fb1 : nullptr; // set as mirror if the update was accepted.
+                    return;
+                    }
+
+                if (_diff2 == nullptr)
+                    { // double buffering with a single diff
+                    _waitUpdateAsyncComplete(); // wait until update is done. 
+                    if ((_mirrorfb == nullptr) || (force_full_redraw))
+                        { // complete redraw needed. 
+                        _dummydiff1->computeDiff(_fb1, fb, getRotation(), _diff_gap, true, _compare_mask); // create a dummy diff and copy to fb1. 
+                        _flush_cache(_fb1, ILI9341_T4_NB_PIXELS * 2);
+                        _mirrorfb = _updateAsync(_fb1, _dummydiff1) ? _fb1 : nullptr; // launch update
+                        }
+                    else
+                        { // diff redraw 
+                        _diff1->computeDiff(_fb1, fb, getRotation(), _diff_gap, true, _compare_mask); // create a diff and copy to fb1. 
+                        _flush_cache(_fb1, ILI9341_T4_NB_PIXELS * 2);
+                        _mirrorfb = _updateAsync(_fb1, _diff1) ? _fb1 : nullptr; // launch update
+                        }
+                    return;
+                    }
+
+                // double buffering with two diffs 
+                if (asyncUpdateActive())
+                    { // _diff2 is available so we use it to create the diff while update is in progress. 
+                    _diff2->computeDiff(_fb1, fb, getRotation(), _diff_gap, false, _compare_mask); // create a diff without copying                    
+                    _waitUpdateAsyncComplete(); // wait until update is done.                    
+                    DiffBuff::copyfb(_fb1, fb, getRotation()); // save the framebuffer in fb1               
+                    _swapdiff();  // swap the diffs so that diff1 contain the new diff.                     
+                    _flush_cache(_fb1, ILI9341_T4_NB_PIXELS * 2);
+                    _mirrorfb = _updateAsync(_fb1, _diff1) ? _fb1 : nullptr; // launch update
+                    }
+                else
+                    {
+                    _diff1->computeDiff(_fb1, fb, getRotation(), _diff_gap, true, _compare_mask); // create a diff and copy
+                    _flush_cache(_fb1, ILI9341_T4_NB_PIXELS * 2);
+                    _mirrorfb = _updateAsync(_fb1, _diff1) ? _fb1 : nullptr; // launch update
+                    }
+                return;
+                }
+            }
+        }
+
+
+
+    FLASHMEM void  ILI9341Driver::_pushpixels_mode0(const uint16_t* fb, int x, int y, int len)
+        {
+        const uint16_t* p = fb + x + (y * ILI9341_T4_TFTWIDTH);
+        while (len-- > 0) { _writedata16_cont(*p++); }
+        }
+
+
+    FLASHMEM void  ILI9341Driver::_pushpixels_mode1(const uint16_t* fb, int xx, int yy, int len)
+        {
+        int x = yy;
+        int y = ILI9341_T4_TFTWIDTH - 1 - xx;
+        while (len-- > 0)
+            {
+            _writedata16_cont(fb[x + ILI9341_T4_TFTHEIGHT*y]);
+            y--;
+            if (y < 0) { y = ILI9341_T4_TFTWIDTH - 1; x++; }
+            }
+        }
+
+
+    FLASHMEM void  ILI9341Driver::_pushpixels_mode2(const uint16_t* fb, int xx, int yy, int len)
+        {
+        int x = ILI9341_T4_TFTWIDTH - 1 - xx;
+        int y = ILI9341_T4_TFTHEIGHT - 1 - yy;
+        const uint16_t* p = fb + x + (y * ILI9341_T4_TFTWIDTH);
+        while (len-- > 0) { _writedata16_cont(*p--); }
+        }
+
+
+    FLASHMEM void  ILI9341Driver::_pushpixels_mode3(const uint16_t* fb, int xx, int yy, int len)
+        {
+        int x = ILI9341_T4_TFTHEIGHT - 1 - yy;
+        int y = xx;    
+        while (len-- > 0)
+            {                     
+            _writedata16_cont(fb[x + ILI9341_T4_TFTHEIGHT*y]);
+            y++;
+            if (y >= ILI9341_T4_TFTWIDTH) { y = 0; x--; }
+            }
+        }
+
+
+    FLASHMEM void ILI9341Driver::_updateNow(const uint16_t* fb, DiffBuffBase* diff)
+        {
+        if ((fb == nullptr) || (diff == nullptr)) return;
+        _waitUpdateAsyncComplete();
+        _startframe(_vsync_spacing > 0);
+        _margin = ILI9341_T4_NB_SCANLINES;
+        _stats_nb_uploaded_pixels = 0;
+                
+        int sc1 = diff->scanlineStartInit();         
+        if (sc1 < 0)
+            { // Diff is empty
+            if (_vsync_spacing > 0)
+                { // note the next time. 
+                uint32_t t1 = micros() + _microToReachScanLine(0, true) - _vsync_spacing * _period;
+                if (t1 > _timeframestart) _timeframestart = t1;
+                _late_start_ratio_override = false;
+                _last_delta = _vsync_spacing;
+                }
+            _endframe();
+            return;
+            }
+        // ok we have at least one instruction
+        if (_vsync_spacing > 0)
+            {
+            const uint32_t dd = (_timeframestart + ((_vsync_spacing - 1) * _period)) - micros();
+            _pauseUploadTime();
+            _delayMicro(dd); // wait until the previous frame is displayed the correct number of times. 
+            _restartUploadTime();
+            // we should now be around scanline 0 (or possibly late). 
+            int sc2 = sc1 + ((ILI9341_T4_NB_SCANLINES - 1 - sc1) * _late_start_ratio); // maximum 'late' scanline
+            uint32_t t2 = _microToReachScanLine(sc2, true); // with resync
+            uint32_t t = _microToReachScanLine(sc1, false); // without resync            
+            if (_late_start_ratio_override)
+                { // force resync which is the same as asking _late_start_ratio=0;
+                _late_start_ratio_override = false; // oneshot. 
+                }
+            else
+                {
+                if (t2 < t) t = 0;  // late, start right away. 
+                }
+            _pauseUploadTime();
+            if (t > 0) delayMicroseconds(t);                                                   // wait if needed
+            while ((t = _microToExitRange(0, sc1))) { delayMicroseconds(t); }                 // make sure we are good (in case delayMicroseconds() in not precise enough).
+            _restartUploadTime();
+            // ok, scanline is just after sc1 (if not late).
+            _slinitpos = _getScanLine(false);   // save initial scanline position
+            _em_async = 0;                      // start the counter
+            const uint32_t tfs = micros() + _microToReachScanLine(0, false);        // time when this frame will start being displayed on the screen. 
+            _last_delta = (int)round(((double)(tfs - _timeframestart)) / (_period));
+            _timeframestart = tfs;
+            }
+            
+        int x = 0, y = 0, len = 0;
+        int r = diff->readDiff(x, y, len, sc1); // pretend we are at sc1 to get the instruction without waiting
+        if ((r != 0) || (len <= 0))
+            {
+            _print("***  Error in LI9341Driver::_updateNow(). THIS SHOULD NEVER HAPPEN !!! ***\n");
+            }
+        diff->initRead(); // reset
+        
+        _beginSPITransaction(_spi_clock);
+        // write full PASET/CASET now and we shall only update the start position from now on.
+        // (NV3007: all addresses sent to the controller are shifted by X/YOFFSET, but the
+        //  x/y variables and the prev_x/prev_y comparisons below stay in screen coordinates)
+        _writecommand_cont(ILI9341_T4_CASET);
+        _writedata16_cont(x + ILI9341_T4_XOFFSET);
+        _writedata16_cont(ILI9341_T4_TFTWIDTH-1 + ILI9341_T4_XOFFSET);
+        _writecommand_cont(ILI9341_T4_PASET);
+        _writedata16_cont(y + ILI9341_T4_YOFFSET);
+        _writedata16_last(ILI9341_T4_TFTHEIGHT-1 + ILI9341_T4_YOFFSET);
+        int prev_x = x;
+        int prev_y = y;
+        while (1)
+            {
+            int asl = (_vsync_spacing > 0) ? (_slinitpos + _nbScanlineDuring(_em_async)) : (2*ILI9341_T4_TFTHEIGHT);
+            int r = diff->readDiff(x, y, len, asl);            
+            if (r > 0)
+                { // we must wait                             
+                int t = _timeForScanlines(r - asl + 1);
+                if (t < ILI9341_T4_MIN_WAIT_TIME) t = ILI9341_T4_MIN_WAIT_TIME;
+                _pauseUploadTime();
+                _delayMicro(t);
+                _restartUploadTime();
+                continue;
+                }
+            if (r < 0)
+                { // finished                                
+                _writecommand_last(ILI9341_T4_NOP);                
+                _endSPITransaction();                               
+                _endframe();
+
+                return;
+                }
+            _stats_nb_uploaded_pixels += len;
+            _stats_nb_transactions++;
+            if (x != prev_x)
+                {
+                _writecommand_cont(ILI9341_T4_CASET);
+                _writedata16_cont(x + ILI9341_T4_XOFFSET);
+                prev_x = x;
+                }
+            if (y != prev_y)
+                {
+                _writecommand_cont(ILI9341_T4_PASET);
+                _writedata16_cont(y + ILI9341_T4_YOFFSET);
+                prev_y = y;
+                }
+            _writecommand_cont(ILI9341_T4_RAMWR);
+            _pushpixels(fb, x, y, len);
+            if (_vsync_spacing > 0)
+                {
+                int m = (ILI9341_T4_TFTWIDTH*y + x + len)/ILI9341_T4_TFTWIDTH + ILI9341_T4_TFTHEIGHT - _slinitpos - _nbScanlineDuring(_em_async);
+                if (m < _margin) _margin = m;
+                }           
+            }
+        
+        }
+
+
+
+        
+    FLASHMEM void ILI9341Driver::_updateRectNow(const uint16_t* sub_fb, int xmin, int xmax, int ymin, int ymax, int stride)
+        {
+        int x1, x2, y1, y2;
+        DiffBuffBase::rotationBox(_rotation, xmin, xmax, ymin, ymax, x1, x2, y1, y2);
+        const int w = x2 - x1 + 1;
+
+        if ((sub_fb == nullptr) || (x2 < x1) || (y2 < y1)) return;
+        _waitUpdateAsyncComplete();
+        _startframe(false);
+        _stats_nb_uploaded_pixels = 0;
+
+        _beginSPITransaction(_spi_clock);
+        _writecommand_cont(ILI9341_T4_CASET);
+        _writedata16_cont(x1 + ILI9341_T4_XOFFSET);   // NV3007: shift into the visible GRAM window
+        _writedata16_cont(x2 + ILI9341_T4_XOFFSET);
+        _writecommand_cont(ILI9341_T4_PASET);
+        _writedata16_cont(y1 + ILI9341_T4_YOFFSET);
+        _writedata16_cont(y2 + ILI9341_T4_YOFFSET);
+        _writecommand_cont(ILI9341_T4_RAMWR);
+
+        int mdelta = 0;
+        switch (_rotation)
+            {
+            case PORTRAIT_240x320: mdelta = 1; break;
+            case LANDSCAPE_320x240: mdelta = -stride; break;
+            case PORTRAIT_240x320_FLIPPED: mdelta = -1; break;
+            case LANDSCAPE_320x240_FLIPPED: mdelta = stride; break;
+            }
+        for (int yc = y1; yc <= y2; yc++)
+            {
+            int m = 0;
+            switch (_rotation)
+                {
+                case PORTRAIT_240x320: m = stride * (yc - y1); break;
+                case LANDSCAPE_320x240: m = (yc - y1) + stride * (x2 - x1); break;
+                case PORTRAIT_240x320_FLIPPED: m = stride * (y2 - yc) + (x2 - x1); break;
+                case LANDSCAPE_320x240_FLIPPED: m = y2 - yc; break;
+                }   
+            for (int n = 0; n < w; n++, m += mdelta) _writedata16_cont(sub_fb[m]);
+            }
+        _writecommand_last(ILI9341_T4_NOP);
+        _endSPITransaction();
+        _endframe();
+        return;
+        }
+        
+
+    FLASHMEM void ILI9341Driver::_pushRect(uint16_t color, int xmin, int xmax, int ymin, int ymax)
+        {
+        int x1, x2, y1, y2;
+        DiffBuffBase::rotationBox(_rotation, xmin, xmax, ymin, ymax, x1, x2, y1, y2);
+        if ((x2 < x1) || (y2 < y1)) return;
+        const int l = (x2 - x1 + 1) * (y2 - y1 + 1);
+        _waitUpdateAsyncComplete();
+        _beginSPITransaction(_spi_clock);
+        _writecommand_cont(ILI9341_T4_CASET);
+        _writedata16_cont(x1 + ILI9341_T4_XOFFSET);   // NV3007: shift into the visible GRAM window
+        _writedata16_cont(x2 + ILI9341_T4_XOFFSET);
+        _writecommand_cont(ILI9341_T4_PASET);
+        _writedata16_cont(y1 + ILI9341_T4_YOFFSET);
+        _writedata16_cont(y2 + ILI9341_T4_YOFFSET);
+        _writecommand_cont(ILI9341_T4_RAMWR);
+        for(int i=0; i < l; i++) _writedata16_cont(color);
+        _writecommand_last(ILI9341_T4_NOP);
+        _endSPITransaction();        
+        return;
+        }
+
+
+
+    FLASHMEM bool ILI9341Driver::_updateAsync(const uint16_t* fb, DiffBuffBase* diff)
+        {
+        /*
+        //override and use _updateNow instead
+        int o = _rotation;
+        _rotation = 0;
+        _updateNow(fb, diff);
+        _rotation = o;
+        return true;
+        */
+        if ((fb == nullptr)|| (diff == nullptr)) return false; // do not call callback for invalid param.
+        _waitUpdateAsyncComplete();
+        _startframe(_vsync_spacing > 0);
+        _stats_nb_uploaded_pixels = 0;
+        _margin = ILI9341_T4_NB_SCANLINES;
+        _dmaObject[_spi_num] = this; // set up object callback.
+        //_flush_cache(fb, 2 * ILI9341_T4_NB_PIXELS); // BEWARE THAT CACHE IF FLUSHED BEFORE CALLING THIS METHOD !
+        _fb = fb;
+        _diff = diff;                
+               
+        int sc1 = diff->scanlineStartInit();  // position of scanline at start 
+        if (sc1 < 0)
+            { // Diff is empty.
+            _dmaObject[_spi_num] = nullptr;
+            if (_vsync_spacing > 0)
+                { // note the next time. 
+                uint32_t t1 = micros() + _microToReachScanLine(0, true) - _vsync_spacing  * _period;
+                if (t1 > _timeframestart) _timeframestart = t1; 
+                _late_start_ratio_override = false;
+                _last_delta = _vsync_spacing;
+                }
+            _endframe();
+            if (_touch_request_read)
+                {
+                _updateTouch2(); // touch update requested. do it now.
+                _touch_request_read = false;
+                }
+            _dmaObject[_spi_num] = nullptr;
+            return true;
+            }
+
+        int x = 0, y = 0, len = 0;
+        int r = diff->readDiff(x, y, len, sc1); // pretend we are at sc1 to get the instruction without waiting
+        if ((r != 0) || (len <= 0))
+            {                
+            _print("***  Error in LI9341Driver::_updateAsync(). THIS SHOULD NEVER HAPPEN !!! ***\n");
+            }            
+        diff->initRead(); // reset
+        
+        // write full PASET/CASET now and we shall only update the start position from now on.
+        // (NV3007: addresses sent to the controller are shifted by X/YOFFSET but
+        //  _prev_caset_x/_prev_paset_y keep tracking unshifted screen coordinates)
+        _beginSPITransaction(_spi_clock);
+        _writecommand_cont(ILI9341_T4_CASET);
+        _writedata16_cont(x + ILI9341_T4_XOFFSET);
+        _writedata16_cont(ILI9341_T4_TFTWIDTH-1 + ILI9341_T4_XOFFSET);
+        _writecommand_cont(ILI9341_T4_PASET);
+        _writedata16_cont(y + ILI9341_T4_YOFFSET);
+        _writedata16_last(ILI9341_T4_TFTHEIGHT-1 + ILI9341_T4_YOFFSET);
+        _endSPITransaction();
+        _prev_caset_x = x;
+        _prev_paset_y = y;
+        _slinitpos = sc1; // save the requested scanline initial position
+
+        _dma_state = ILI9341_T4_DMA_ON;
+
+        if (_vsync_spacing <= 0)
+            { // call next method asap
+            _pauseUploadTime();
+            if (!_setTimerIn(1, &ILI9341Driver::_subFrameTimerStartcb)) // call now
+                {
+                _abortAsyncUpdateNoTimer(false);
+                _pauseCpuTime();
+                return false;
+                }
+            }
+        else
+            { // time the call of the next method with vsync 
+            _pauseUploadTime();
+            if (!_setTimerAt(_timeframestart + (_vsync_spacing - 1) * _period, &ILI9341Driver::_subFrameTimerStartcb)) // call at start of screen refresh.
+                {
+                _abortAsyncUpdateNoTimer(false);
+                _pauseCpuTime();
+                return false;
+                }
+            }
+
+        _pauseCpuTime();
+        return true;
+        }
+
+
+    FLASHMEM void ILI9341Driver::_subFrameTimerStartcb()
+        {
+        // we should be around scanline 0 (unless we are late). 
+        _restartCpuTime();
+        _restartUploadTime();
+        if (_vsync_spacing <= 0)
+            {
+            _pauseUploadTime();
+            if (!_setTimerIn(1, &ILI9341Driver::_subFrameTimerStartcb2))
+                {
+                _abortAsyncUpdateNoTimer(false);
+                _pauseCpuTime();
+                return;
+                }
+            }
+        else
+            {
+            int sc1 = _slinitpos;
+            int sc2 = sc1 + ((ILI9341_T4_NB_SCANLINES - 1 - sc1) * _late_start_ratio); // maximum 'late' scanline
+            uint32_t t2 = _microToReachScanLine(sc2, true); // with resync
+            uint32_t t = _microToReachScanLine(sc1, false); // without resync            
+            if (_late_start_ratio_override)
+                { // force resync which is the same as asking _late_start_ratio=0;
+                _late_start_ratio_override = false; // oneshot. 
+                }
+            else
+                {
+                if (t2 < t) t = 0;  // late, start right away. 
+                }
+            _pauseUploadTime();
+            if (!_setTimerIn(t, &ILI9341Driver::_subFrameTimerStartcb2)) // call when ready to start transfer.
+                {
+                _abortAsyncUpdateNoTimer(false);
+                _pauseCpuTime();
+                return;
+                }
+            }
+        _pauseCpuTime();
+        return;
+        }
+
+
+
+    FLASHMEM void ILI9341Driver::_subFrameTimerStartcb2()
+        {
+        _restartUploadTime();
+        _restartCpuTime();
+
+        if (_vsync_spacing > 0)
+            {
+            int t;
+            while((t = _microToExitRange(0, _slinitpos))) { delayMicroseconds(t); }  // make sure we are good
+            // ok, scanline is just after sc1 (if not late).
+            _slinitpos = _getScanLine(false);   // save initial scanline position
+            _em_async = 0;                      // start the counter
+            const uint32_t tfs = micros() + _microToReachScanLine(0, false);        // time when this frame will start being displayed on the screen. 
+            _last_delta = (int)round(((double)(tfs - _timeframestart)) / (_period));           
+            _timeframestart = tfs;
+            }
+
+        // read the first instruction
+        int x = 0, y = 0, len = 0;
+        int asl = 2 * ILI9341_T4_TFTHEIGHT; // make sure readDiff returns 0.  (_vsync_spacing > 0) ? _slinitpos  : (2 * ILI9341_T4_TFTHEIGHT);
+        int r = _diff->readDiff(x, y, len, asl);
+        // Debugging point for x/y/len/r/asl.
+        if ((r != 0)||(len == 0)||(x != _prev_caset_x)||(y != _prev_paset_y))
+            { // this should not happen, but try to fail gracefully.            
+            _endframe();
+            if (_touch_request_read)
+                {
+                _updateTouch2(); // touch update requested. do it now.
+                _touch_request_read = false;
+                }
+            _dmaObject[_spi_num] = nullptr;
+            _dma_state = ILI9341_T4_DMA_IDLE;
+            if (_dmaCB) {_dmaCB(_dmaCBdata); } // call the user callback is present to signal the end of the async transfer
+            return;
+            }
+
+        _dma_set_base_tcr();
+
+        _last_y = (ILI9341_T4_TFTWIDTH * y + x + len) / ILI9341_T4_TFTWIDTH;
+        _stats_nb_uploaded_pixels = len;
+
+        _dmatx.sourceBuffer(_fb + x + (y * ILI9341_T4_TFTWIDTH), 2 * len);
+        _dmatx.destination(_pimxrt_spi->TDR);
+        _dmatx.TCD->ATTR_DST = 1;
+        _dmatx.interruptAtCompletion();
+        _dmatx.disableOnCompletion();
+        
+        _dmatx.triggerAtHardwareEvent(_spi_hardware->tx_dma_channel);
+        if (_spi_num == 0) _dmatx.attachInterrupt(_dmaInterruptSPI0Diff);
+        else if (_spi_num == 1) _dmatx.attachInterrupt(_dmaInterruptSPI1Diff);
+        else _dmatx.attachInterrupt(_dmaInterruptSPI2Diff);
+       
+        // start spi transaction
+        _beginSPITransaction(_spi_clock);
+
+        _pimxrt_spi->FCR = 0;
+        _maybeUpdateTCR(_tcr_dc_assert | LPSPI_TCR_FRAMESZ(7) | LPSPI_TCR_RXMSK); // bug with the continu flag | LPSPI_TCR_CONT , why ?
+        _pimxrt_spi->DER = LPSPI_DER_TDDE;
+        _pimxrt_spi->SR = 0x3f00;
+
+        if (_hardware_dc)
+            {            
+            _pimxrt_spi->FCR = LPSPI_FCR_TXWATER(2); // DO NOT CHANGE, WE NEED TO HAVE ALWAYS 14 WORD AVALAILABLE IN TX !!!
+            }
+        else
+            { 
+            // optimization depending on the spi speed. 
+            // we want to start before the end of the last DMA transfer but not to early otherwise we will wait. 
+            if (_spi_clock < 50000000) _pimxrt_spi->FCR = LPSPI_FCR_TXWATER(0);
+            else if (_spi_clock < 80000000) _pimxrt_spi->FCR = LPSPI_FCR_TXWATER(1);
+            else _pimxrt_spi->FCR = LPSPI_FCR_TXWATER(2);
+            }
+
+        _dma_assert_dc();
+        _pimxrt_spi->TDR = ILI9341_T4_RAMWR;
+        _dma_deassert_dc();
+
+        noInterrupts();
+        NVIC_SET_PRIORITY(IRQ_DMA_CH0 + _dmatx.channel, _irq_priority);
+        _dmatx.begin(false);        
+        _dmatx.enable(); // go !
+        NVIC_SET_PRIORITY(IRQ_DMA_CH0 + _dmatx.channel, _irq_priority);
+        interrupts();
+        _pauseCpuTime();
+        }
+
+
+
+    FLASHMEM void ILI9341Driver::_subFrameInterruptDiff()
+        {
+        if (_vsync_spacing > 0)
+            { // check margin when using vsync
+            int m = _last_y + ILI9341_T4_TFTHEIGHT - _slinitpos - _nbScanlineDuring(_em_async);
+            if (m < _margin) _margin = m;
+            }
+        int x = 0, y = 0, len = 0;
+        int asl = (_vsync_spacing > 0) ? (_slinitpos + _nbScanlineDuring(_em_async)) : (2 * ILI9341_T4_TFTHEIGHT);
+        int r = _diff->readDiff(x, y, len, asl);
+        if (r < 0)
+            { // we are done !                    
+            while (_pimxrt_spi->FSR & 0x1f);        // wait for transmit fifo to be empty
+            while (_pimxrt_spi->SR & LPSPI_SR_MBF); // wait while spi bus is busy. 
+            _pimxrt_spi->FCR = LPSPI_FCR_TXWATER(15); // Transmit Data Flag (TDF) should now be set when there if less or equal than 15 words in the transmit fifo
+            _pimxrt_spi->IER = 0; // disable SPI interrupts
+            _pimxrt_spi->DER = 0; // DMA no longer doing TX (nor RX)
+            _pimxrt_spi->CR = LPSPI_CR_MEN | LPSPI_CR_RRF | LPSPI_CR_RTF; // enable module (MEM), reset RX fifo (RRF), reset TX fifo (RTF)
+            _pimxrt_spi->SR = 0x3f00; // clear out all of the other status...
+            /*
+            _maybeUpdateTCR(_tcr_dc_assert | LPSPI_TCR_FRAMESZ(7)); // output Command with 8 bits            
+            _writecommand_last(ILI9341_T4_NOP);
+            */
+            _endSPITransaction();
+            _endframe();
+            if (_touch_request_read)
+                {
+                _updateTouch2(); // touch update requested. do it now.
+                _touch_request_read = false;
+                }
+            // _flush_cache(_fb, 2 * ILI9341_T4_NB_PIXELS);   /// NOT USEFUL AFTER NO ????
+            _dmaObject[_spi_num] = nullptr;
+            _dma_state = ILI9341_T4_DMA_IDLE;
+            if (_dmaCB) {_dmaCB(_dmaCBdata); } // call the user callback is present to signal the end of the async transfer
+            return;
+            }
+        else if (r > 0)
+            { // we must wait
+            int t = _timeForScanlines(r - asl + 1);
+            if (t < ILI9341_T4_MIN_WAIT_TIME) t = ILI9341_T4_MIN_WAIT_TIME;
+            //while (_pimxrt_spi->FSR & 0x1f);        // wait for transmit fifo to be empty
+            //while (_pimxrt_spi->SR & LPSPI_SR_MBF); // wait while spi bus is busy. 
+            _pauseUploadTime();
+            if (!_setTimerIn(t, &ILI9341Driver::_subFrameInterruptDiff2))
+                {
+                _abortAsyncUpdateNoTimer(true);
+                _pauseCpuTime();
+                return;
+                }
+            _pauseCpuTime();            
+            return;
+            }
+        // new instruction        
+        if (_hardware_dc)
+            { 
+            // give all commands directly using the FIFO and hardware toogle of DC                    
+            if (x != _prev_caset_x)
+                {
+                _pimxrt_spi->TCR = _dma_spi_tcr_assert;
+                _pimxrt_spi->TDR = ILI9341_T4_CASET;
+                _pimxrt_spi->TCR = _dma_spi_tcr_deassert;
+                _pimxrt_spi->TDR = x + ILI9341_T4_XOFFSET;   // NV3007: shift into the visible GRAM window
+                _prev_caset_x = x;
+                }
+            if (y != _prev_paset_y)
+                {
+                _pimxrt_spi->TCR = _dma_spi_tcr_assert;
+                _pimxrt_spi->TDR = ILI9341_T4_PASET;
+                _pimxrt_spi->TCR = _dma_spi_tcr_deassert;
+                _pimxrt_spi->TDR = y + ILI9341_T4_YOFFSET;   // NV3007: shift into the visible GRAM window
+                _prev_paset_y = y;
+                }
+
+            _pimxrt_spi->TCR = _dma_spi_tcr_assert;
+            _pimxrt_spi->TDR = ILI9341_T4_RAMWR;
+            _pimxrt_spi->TCR = _dma_spi_tcr_deassert;
+
+            const uint16_t* p = _fb + x + (y * ILI9341_T4_TFTWIDTH);
+            _last_y = (ILI9341_T4_TFTWIDTH * y + x + len) / ILI9341_T4_TFTWIDTH;
+            _stats_nb_uploaded_pixels += len;
+
+            if (len < 4)
+                { // short buffer, use the fifo
+                _pimxrt_spi->TDR = p[0];
+                if (len >= 2)
+                    {
+                    _pimxrt_spi->TDR = p[1];
+                    if (len >= 3) _pimxrt_spi->TDR = p[2];
+                    }
+                _pimxrt_spi->SR = 0x3f00; // clear flag
+                _pimxrt_spi->IER = LPSPI_IER_TDIE; // interrupt when only 2 words remain in the fifo
+                }
+            else
+                { // long buffer, use DMA. 
+                _dmatx.sourceBuffer(p, len * 2);
+                _dmatx.enable();
+                }
+            }
+        else
+            { // use the SPI interrupt to synchronize DC toogling without busy wait
+
+            // prepare interrupt commands
+            _spi_int_phase = 0;
+            _spi_int_command[0] = ILI9341_T4_RAMWR;
+
+            if (y != _prev_paset_y)
+                {
+                _spi_int_command[++_spi_int_phase] = y + ILI9341_T4_YOFFSET;   // NV3007: shift into the visible GRAM window
+                _spi_int_command[++_spi_int_phase] = ILI9341_T4_PASET;
+                _prev_paset_y = y;
+                }
+            if (x != _prev_caset_x)
+                {
+                _spi_int_command[++_spi_int_phase] = x + ILI9341_T4_XOFFSET;   // NV3007: shift into the visible GRAM window
+                _spi_int_command[++_spi_int_phase] = ILI9341_T4_CASET;
+                _prev_caset_x = x;
+                }
+
+            // prepare next DMA transfer
+            _dmatx.sourceBuffer(_fb + x + (y * ILI9341_T4_TFTWIDTH), len * 2);
+            _last_y = (ILI9341_T4_TFTWIDTH * y + x + len) / ILI9341_T4_TFTWIDTH;
+            _stats_nb_uploaded_pixels += len;
+           
+            // make sure previous dma transfer is finished and assert DC and set frame(7)
+            _dma_assert_dc(); // THIS IS THE ONLY BUSY WAIT: TXWATER is choosen to minimize this wait according to the SPI speed
+
+            // clear flags
+            _pimxrt_spi->SR = 0x3f00;
+
+            // interrupt after each frame
+            noInterrupts();
+            _pimxrt_spi->IER = LPSPI_IER_WCIE;  
+            _pimxrt_spi->TDR = _spi_int_command[_spi_int_phase--]; // send the first command
+            _pimxrt_spi->TCR = _dma_spi_tcr_deassert; // and then back to frame(15)
+            interrupts();
+            // now we wait for the interrupt before toogling DC and sending the next frame... 
+            }
+        return;
+        }
+
+
+    FLASHMEM void ILI9341Driver::_subFrameInterruptDiff2()
+        {
+        //noInterrupts();        // UNNEEDED ?
+        _restartUploadTime();
+        _restartCpuTime();
+        _subFrameInterruptDiff();
+        _pauseCpuTime();
+        //interrupts();        // UNNEEDED ?
+        }
+
+
+
+    /**********************************************************************************************************
+    * DMA Interrupts
+    ***********************************************************************************************************/
+
+    ILI9341Driver* volatile ILI9341Driver::_dmaObject[3] = { nullptr, nullptr, nullptr }; 
+
+
+    FLASHMEM void ILI9341Driver::_dmaInterruptDiff()
+        { 
+        //noInterrupts();        // UNNEEDED ?
+        _dmatx.clearInterrupt();
+        _dmatx.clearComplete();
+        _restartCpuTime();
+        _stats_nb_transactions++; // count a spi transaction
+        _subFrameInterruptDiff();
+        _pauseCpuTime();
+        //interrupts();        // UNNEEDED ?
+        return;
+        }
+
+
+
+
+
+
+
+
+
+
+
+    /**********************************************************************************************************
+    * IntervalTimer
+    ***********************************************************************************************************/
+
+    ILI9341Driver* volatile ILI9341Driver::_pitObj[4] = {nullptr, nullptr, nullptr, nullptr};   // definition 
+
+    FLASHMEM void ILI9341Driver::_abortAsyncUpdateNoTimer(bool spi_transaction_active)
+        {
+        _print("*** WARNING: ILI9341Driver async update aborted: no PIT IntervalTimer available. ***\n");
+        _print("    All PIT timers may already be in use; screen mirror state invalidated.\n");
+
+        _it.end();
+        _istimer = false;
+        _dmatx.disable();
+        _dmatx.clearInterrupt();
+        _dmatx.clearComplete();
+
+        if (spi_transaction_active)
+            {
+            while (_pimxrt_spi->FSR & 0x1f);        // wait for transmit fifo to be empty
+            while (_pimxrt_spi->SR & LPSPI_SR_MBF); // wait while spi bus is busy.
+            _pimxrt_spi->FCR = LPSPI_FCR_TXWATER(15);
+            _pimxrt_spi->IER = 0;
+            _pimxrt_spi->DER = 0;
+            _pimxrt_spi->CR = LPSPI_CR_MEN | LPSPI_CR_RRF | LPSPI_CR_RTF;
+            _pimxrt_spi->SR = 0x3f00;
+            _endSPITransaction();
+            }
+
+        _mirrorfb = nullptr;
+        _ongoingDiff = nullptr;
+        _touch_request_read = false;
+        _dmaObject[_spi_num] = nullptr;
+        _dma_state = ILI9341_T4_DMA_IDLE;
+        }
+
+
+    FLASHMEM void ILI9341Driver::_timerinit()
+        {
+        _istimer = false; 
+        for (int i = 0; i < 4; i++)
+            {
+            if (_pitObj[i] == nullptr)
+                {
+                _pitObj[i] = this;
+                _pitindex = i;
+                return;
+                }
+            }
+        // OUCH !Boom boom boom booom...
+        _print("\n *** TOO MANY INSTANCES OF ILI9341Driver CREATED ***\n\n");
+        }
+
+
+
+
+
+
+
+
+
+
+    /**********************************************************************************************************
+    * SPI
+    ***********************************************************************************************************/
+
+
+    FLASHMEM void ILI9341Driver::_drawRect(int xmin, int xmax, int ymin, int ymax, uint16_t color)
+        {
+        _waitUpdateAsyncComplete();
+        _beginSPITransaction(_spi_clock);
+        _writecommand_cont(ILI9341_T4_PASET);
+        _writedata16_cont(ymin + ILI9341_T4_YOFFSET);   // NV3007: shift into the visible GRAM window
+        _writedata16_cont(ymax + ILI9341_T4_YOFFSET);
+        _writecommand_cont(ILI9341_T4_CASET);
+        _writedata16_cont(xmin + ILI9341_T4_XOFFSET);
+        _writedata16_cont(xmax + ILI9341_T4_XOFFSET);
+        _writecommand_cont(ILI9341_T4_RAMWR);
+        for (int i = 0; i < (xmax - xmin + 1) * (ymax - ymin + 1); i++) _writedata16_cont(color);
+        _writecommand_last(ILI9341_T4_NOP);
+        _endSPITransaction();
+        _mirrorfb = nullptr;
+        _ongoingDiff = nullptr;
+        }
+
+
+    FLASHMEM uint8_t ILI9341Driver::_readcommand8(uint8_t c, uint8_t index, int timeout_ms)
+        {
+        // Bail if not valid miso
+        if (_miso == 255)
+            {
+            _print("*** WARNING: _readcommand8() called while MISO=255 ***\n");
+            return 0;
+            }
+        uint8_t r = 0;
+        _beginSPITransaction(_spi_clock_read);
+        // Lets assume that queues are empty as we just started transaction.
+        _pimxrt_spi->CR = LPSPI_CR_MEN | LPSPI_CR_RRF /* | LPSPI_CR_RTF */; // actually clear both...        
+        _maybeUpdateTCR(_tcr_dc_assert | LPSPI_TCR_FRAMESZ(7) | LPSPI_TCR_CONT);
+        _pimxrt_spi->TDR = 0xD9; // writecommand(0xD9); // sekret command        
+        _maybeUpdateTCR(_tcr_dc_not_assert | LPSPI_TCR_FRAMESZ(7) | LPSPI_TCR_CONT);
+        _pimxrt_spi->TDR = 0x10 + index; // writedata(0x10 + index);        
+        _maybeUpdateTCR(_tcr_dc_assert | LPSPI_TCR_FRAMESZ(7) | LPSPI_TCR_CONT);
+        _pimxrt_spi->TDR = c; // writecommand(c);        
+        _maybeUpdateTCR(_tcr_dc_not_assert | LPSPI_TCR_FRAMESZ(7));
+        _pimxrt_spi->TDR = 0; // readdata
+        // Now wait until completed.
+        elapsedMillis ems; 
+        uint8_t rx_count = 4;
+        while (rx_count && ((timeout_ms <= 0) || (ems < (uint32_t)timeout_ms)))
+            {
+            if ((_pimxrt_spi->RSR & LPSPI_RSR_RXEMPTY) == 0)
+                {
+                r = _pimxrt_spi->RDR; // Read any pending RX bytes in
+                rx_count--;           // decrement count of bytes still levt
+                }
+            }
+        _endSPITransaction();
+        if (rx_count) return 0; // timeout
+        return r; // get the received byte... should check for it first...
+        }
+
+
+
+    void ILI9341Driver::_waitFifoNotFull()
+        {
+        uint32_t tmp __attribute__((unused));
+        do
+            {
+            if ((_pimxrt_spi->RSR & LPSPI_RSR_RXEMPTY) == 0)
+                {
+                tmp = _pimxrt_spi->RDR; // Read any pending RX bytes in
+                if (_pending_rx_count) _pending_rx_count--; // decrement count of bytes still levt
+                }
+            } 
+        while ((_pimxrt_spi->SR & LPSPI_SR_TDF) == 0);
+        }
+
+
+    void ILI9341Driver::_waitTransmitComplete()
+        {           
+        uint32_t tmp __attribute__((unused));                       
+        elapsedMicros em = 0; 
+        bool warning_printed = false;
+        while(_pending_rx_count)
+            {
+            if ((_pimxrt_spi->RSR & LPSPI_RSR_RXEMPTY) == 0)
+                {
+                tmp = _pimxrt_spi->RDR; // Read any pending RX bytes in
+                _pending_rx_count--;     // decrement count of bytes still levt
+                continue;
+                }
+            if (em > 1000)
+                {
+                const uint32_t sr = _pimxrt_spi->SR;
+                const uint32_t fsr = _pimxrt_spi->FSR;
+                const uint32_t rsr = _pimxrt_spi->RSR;
+                const uint32_t rx_count = (fsr >> 16) & 0x1F;
+                if (((rsr & LPSPI_RSR_RXEMPTY) == 0) || (sr & LPSPI_SR_RDF) || rx_count)
+                    {
+                    continue;
+                    }
+                const uint32_t cr = _pimxrt_spi->CR;
+                const uint32_t tcr = _pimxrt_spi->TCR;
+                const uint32_t fcr = _pimxrt_spi->FCR;
+                const uint32_t der = _pimxrt_spi->DER;
+                const uint32_t ier = _pimxrt_spi->IER;
+                if (!warning_printed)
+                    {
+                    const auto printHex8 = [&](uint32_t v)
+                        {
+                        static const char hex[] = "0123456789ABCDEF";
+                        for (int shift = 28; shift >= 0; shift -= 4) _print(hex[(v >> shift) & 0x0F]);
+                        };
+                    const auto printFlag = [&](uint32_t v)
+                        {
+                        _print(v ? 1 : 0);
+                        };
+                    _print("***  WARNING: hanging in  ILI9341Driver::_waitTransmitComplete() ...***\n");
+                    _print("    pending_rx="); _print((uint32_t)_pending_rx_count);
+                    _print(" elapsed="); _print((uint32_t)em);
+                    _print("us spi="); _print(_spi_clock); _print("Hz\n");
+                    _print("    SR="); printHex8(sr);
+                    _print(" FSR="); printHex8(fsr);
+                    _print(" RSR="); printHex8(rsr);
+                    _print(" CR="); printHex8(cr);
+                    _print(" TCR="); printHex8(tcr); _print("\n");
+                    _print("    FCR="); printHex8(fcr);
+                    _print(" DER="); printHex8(der);
+                    _print(" IER="); printHex8(ier);
+                    _print(" TXCOUNT="); _print((uint32_t)(fsr & 0x1F));
+                    _print(" RXCOUNT="); _print((uint32_t)rx_count); _print("\n");
+                    _print("    flags: MBF="); printFlag(sr & LPSPI_SR_MBF);
+                    _print(" TDF="); printFlag(sr & LPSPI_SR_TDF);
+                    _print(" RDF="); printFlag(sr & LPSPI_SR_RDF);
+                    _print(" TCF="); printFlag(sr & LPSPI_SR_TCF);
+                    _print(" RXEMPTY="); printFlag(rsr & LPSPI_RSR_RXEMPTY); _print("\n");
+                    warning_printed = true;
+                    }
+                if (((sr & LPSPI_SR_MBF) == 0) && ((fsr & 0x1f) == 0))
+                    {
+                    break; // pending count got out of sync; give up only once the bus is idle.
+                    }
+                }
+            }                
+        _pimxrt_spi->CR = LPSPI_CR_MEN | LPSPI_CR_RRF; // Clear RX FIFO
+        _pending_rx_count = 0;
+        }
+
+
+
+
+
+    /**********************************************************************************************************
+    * Drawing characters
+    * (adapted from the tgx library)
+    ***********************************************************************************************************/
+
+
+
+    uint32_t ILI9341Driver::_fetchbits_unsigned(const uint8_t* p, uint32_t index, uint32_t required)
+        {
+        uint32_t val;
+        uint8_t* s = (uint8_t*)&p[index >> 3];
+    #ifdef UNALIGNED_IS_SAFE        // is this defined anywhere ? 
+        val = *(uint32_t*)s; // read 4 bytes - unaligned is ok
+        val = __builtin_bswap32(val); // change to big-endian order
+    #else
+        val = s[0] << 24;
+        val |= (s[1] << 16);
+        val |= (s[2] << 8);
+        val |= s[3];
+    #endif
+        val <<= (index & 7); // shift out used bits
+        if (32 - (index & 7) < required) 
+            { // need to get more bits
+            val |= (s[4] >> (8 - (index & 7)));
+            }
+        val >>= (32 - required); // right align the bits
+        return val;
+        }
+
+
+    uint32_t ILI9341Driver::_fetchbits_signed(const uint8_t* p, uint32_t index, uint32_t required)
+        {
+        uint32_t val = _fetchbits_unsigned(p, index, required);
+        if (val & (1 << (required - 1))) 
+            {
+            return (int32_t)val - (1 << required);
+            }
+        return (int32_t)val;
+        }
+
+
+    FLASHMEM bool ILI9341Driver::_clipit(int& x, int& y, int& sx, int& sy, int & b_left, int & b_up, int lx, int ly)
+        {
+        b_left = 0;
+        b_up = 0; 
+        if ((sx < 1) || (sy < 1) || (y >= ly) || (y + sy <= 0) || (x >= lx) || (x + sx <= 0))
+            { // completely outside of image
+            return false;
+            }
+        if (y < 0)
+            {
+            b_up = -y;
+            sy += y;
+            y = 0;
+            }
+        if (y + sy > ly)
+            {
+            sy = ly - y;
+            }
+        if (x < 0)
+            {
+            b_left = -x;
+            sx += x;
+            x = 0;
+            }
+        if (x + sx > lx)
+            {
+            sx = lx - x;
+            }
+        return true;
+        }
+
+
+
+    FLASHMEM void ILI9341Driver::_measureChar(char c, int pos_x, int pos_y, int& min_x, int& max_x, int& min_y, int& max_y, const void* pfont, int& xadvance)
+        {
+        const ILI9341_t3_font_t & font = *((const ILI9341_t3_font_t *)pfont);
+        uint8_t n = (uint8_t)c;
+        if ((n >= font.index1_first) && (n <= font.index1_last))
+            {
+            n -= font.index1_first;
+            }
+        else if ((n >= font.index2_first) && (n <= font.index2_last))
+            {
+            n = (n - font.index2_first) + (font.index1_last - font.index1_first + 1);
+            }
+        else
+            { // no char to draw
+            xadvance = 0;
+            return; // nothing to draw. 
+            }
+        uint8_t* data = (uint8_t*)font.data + _fetchbits_unsigned(font.index, (n * font.bits_index), font.bits_index);
+        int32_t off = 0;
+        uint32_t encoding = _fetchbits_unsigned(data, off, 3);
+        if (encoding != 0)
+            { // wrong/unsupported format
+            xadvance = 0;
+            return; 
+            }
+        off += 3;
+        const int sx = (int)_fetchbits_unsigned(data, off, font.bits_width);
+        off += font.bits_width;
+        //const int sy = (int) _fetchbits_unsigned(data, off, font.bits_height);
+        off += font.bits_height;
+        const int xoffset = (int)_fetchbits_signed(data, off, font.bits_xoffset);
+        off += font.bits_xoffset;
+        //const int yoffset = (int)_fetchbits_signed(data, off, font.bits_yoffset);
+        off += font.bits_yoffset;
+        xadvance = (int)_fetchbits_unsigned(data, off, font.bits_delta);
+        min_x = pos_x;
+        max_x = pos_x + xoffset + sx - 1;
+        min_y = pos_y - font.cap_height - 2;
+        max_y = min_y + font.line_space - 1; 
+        }
+
+
+    FLASHMEM void ILI9341Driver::_measureText(const char* text, int pos_x, int pos_y, int& min_x, int& max_x, int& min_y, int& max_y, const void * pfont, bool start_newline_at_0)
+        {
+        const int startx = start_newline_at_0 ? 0 : pos_x;        
+        min_x = pos_x; 
+        max_x = pos_x; 
+        min_y = pos_y; 
+        max_y = pos_y;        
+        const size_t l = strlen(text);
+        for (size_t i = 0; i < l; i++)
+            {
+            const char c = text[i];
+            if (c == '\n')
+                {
+                pos_x = startx;
+                pos_y += ((const ILI9341_t3_font_t*)pfont)->line_space;
+                }
+            else
+                {
+                int xa = 0;
+                int mx = min_x;
+                int Mx = max_x;
+                int my = min_y;
+                int My = max_y;
+                _measureChar(c, pos_x, pos_y, mx, Mx, my, My, pfont, xa);
+                if (mx < min_x) min_x = mx;
+                if (my < min_y) min_y = my;
+                if (Mx > max_x) max_x = Mx;
+                if (My > max_y) max_y = My;
+                pos_x += xa;
+                }
+            }
+        }
+
+
+    FLASHMEM void ILI9341Driver::_drawTextILI(const char* text, int pos_x , int  pos_y, uint16_t col, const void * pfont, bool start_newline_at_0, int lx, int ly, int stride, uint16_t* buffer, float opacity)
+        {
+        if (opacity <= 0.0f) return; 
+        if (opacity >= 1.0f) opacity = 1.0f;
+        const int startx = start_newline_at_0 ? 0 : pos_x;
+        const size_t l = strlen(text);
+        for (size_t i = 0; i < l; i++)
+            {
+            const char c = text[i];
+            if (c == '\n')
+                {
+                pos_x = startx;
+                pos_y += ((const ILI9341_t3_font_t*)pfont)->line_space;
+                }
+            else
+                {
+                _drawCharILI(c, pos_x, pos_y, col, pfont, lx, ly, stride, buffer, opacity);
+                }
+            }
+        }
+
+
+    FLASHMEM void ILI9341Driver::_drawCharILI(char c, int & pos_x, int & pos_y, uint16_t col, const void * pfont, int lx, int ly, int stride, uint16_t* buffer, float opacity)
+        {
+        const ILI9341_t3_font_t& font = *((const ILI9341_t3_font_t*)pfont);
+        uint8_t n = (uint8_t)c;
+        if ((n >= font.index1_first) && (n <= font.index1_last))
+            {
+            n -= font.index1_first;
+            }
+        else if ((n >= font.index2_first) && (n <= font.index2_last))
+            {
+            n = (n - font.index2_first) + (font.index1_last - font.index1_first + 1);
+            }
+        else
+            { // no char to draw
+            return;
+            }
+        uint8_t * data = (uint8_t *)font.data + _fetchbits_unsigned(font.index, (n*font.bits_index), font.bits_index);
+        int32_t off = 0; 
+        uint32_t encoding = _fetchbits_unsigned(data, off, 3);
+        if (encoding != 0) return; // wrong/unsupported format
+        off += 3;
+        int sx = (int)_fetchbits_unsigned(data, off, font.bits_width);
+        off += font.bits_width;         
+        int sy = (int)_fetchbits_unsigned(data, off, font.bits_height);
+        off += font.bits_height;            
+        const int xoffset = (int)_fetchbits_signed(data, off, font.bits_xoffset);
+        off += font.bits_xoffset;
+        const int yoffset = (int)_fetchbits_signed(data, off, font.bits_yoffset);
+        off += font.bits_yoffset;
+        const int delta = (int)_fetchbits_unsigned(data, off, font.bits_delta);
+        off += font.bits_delta;
+        int x = pos_x + xoffset;
+        int y = pos_y - sy - yoffset;
+        const int rsx = sx; // save the real bitmap width; 
+        int b_left, b_up;
+        if ((_clipit(x, y, sx, sy, b_left, b_up, lx, ly)) && (font.version == 23) && (font.reserved == 2))
+            { // only draw antialised, 4bpp, v2.3 characters
+            data += (off >> 3) + ((off & 7) ? 1 : 0); // bitmap begins at the next byte boundary
+            _drawCharBitmap_4BPP(data, rsx, b_up, b_left, sx, sy, x, y, col, stride, buffer, opacity);
+            }
+        pos_x += delta;
+        return;
+        }
+
+
+    FLASHMEM void ILI9341Driver::_drawCharBitmap_4BPP(const uint8_t* bitmap, int rsx, int b_up, int b_left, int sx, int sy, int x, int y, uint16_t col, int stride, uint16_t * buffer, float opacity)
+        {
+        const int iop = 137 * (int)(256 * opacity);
+        if (sx >= 2)
+            { // each row has at least 2 pixels
+            for (int dy = 0; dy < sy; dy++)
+                {
+                int32_t off = (b_up + dy) * (rsx) + (b_left);
+                uint16_t* p = buffer + (stride) * (y + dy) + (x);
+                int dx = sx;
+                if (off & 1)
+                    {// not at the start of a bitmap byte: we first finish it. 
+                    const uint8_t b = bitmap[off >> 1];
+                    const int v = (b & 15); 
+                    *p = _blend32(*p, col, (v * iop) >> 14);
+                    p++;
+                    off++; dx--;
+                    }
+                while (dx >= 2)
+                    {
+                    const uint8_t b = bitmap[off >> 1];
+                    if (b)
+                        {
+                        { const int v = ((b & 240) >> 4); p[0] = _blend32(p[0], col, (v * iop) >> 14); }
+                        { const int v = (b & 15); p[1] = _blend32(p[1], col, (v * iop) >> 14); }
+                        }
+                    off += 2;
+                    p += 2;
+                    dx -= 2;
+                    }
+                if (dx > 0)
+                    {
+                    const uint8_t b = bitmap[off >> 1];
+                    const int v = ((b & 240) >> 4); *p = _blend32(*p, col, (v * iop) >> 14);
+                    }
+                }
+            }
+        else
+            { // each row has a single pixel 
+            uint16_t* p = buffer + (stride) * (y) + (x);
+            int32_t off = (b_up) * (rsx) + (b_left);
+            while (sy-- > 0)
+                {
+                const uint8_t b = bitmap[off >> 1];
+                const int v = (off & 1) ? (b & 15) : ((b & 240) >> 4);
+                *p = _blend32(*p, col, (v * iop) >> 14);
+                p += stride;
+                off += rsx;
+                }
+            }
+        }
+
+
+    FLASHMEM void ILI9341Driver::_fillRect(int xmin, int xmax, int ymin, int ymax, int lx, int ly, int stride, uint16_t* buffer, uint16_t color, float opacity)
+        {
+        if (opacity <= 0.0f) return;
+        if (xmin < 0) xmin = 0; 
+        if (xmax >= lx) xmax = lx - 1;
+        if (ymin < 0) ymin = 0;
+        if (ymax >= ly) ymax = ly - 1;
+
+        const uint32_t a = (opacity >= 1.0f) ? 32 : (32 * opacity);
+        for (int j = ymin; j <= ymax; j++)
+            {
+            for (int i = xmin; i <= xmax; i++)
+                {
+                auto& d = buffer[i + j * stride];
+                d = _blend32(d, color, a);
+                }
+            }
+        }
+
+
+
+
+
+
+    FLASHMEM void ILI9341Driver::_uploadText(const char* text, int pos_x, int pos_y, uint16_t col, uint16_t col_bg, const void* pfont, bool start_newline_at_0)
+        {
+        const int startx = start_newline_at_0 ? 0 : pos_x;
+        const size_t l = strlen(text);
+        for (size_t i = 0; i < l; i++)
+            {
+            const char c = text[i];
+            if (c == '\n')
+                {
+                pos_x = startx;
+                pos_y += ((const ILI9341_t3_font_t*)pfont)->line_space;
+                }
+            else
+                {
+                _uploadChar(c, pos_x, pos_y, col, col_bg, pfont);
+                }
+            }
+        }
+
+
+    FLASHMEM void ILI9341Driver::_uploadChar(char c, int& pos_x, int& pos_y, uint16_t col, uint16_t col_bg, const void* pfont)
+        {
+        const int MAX_CHAR_SIZE_LX = 20; 
+        const int MAX_CHAR_SIZE_LY = 20; 
+
+        uint16_t buffer[MAX_CHAR_SIZE_LX * MAX_CHAR_SIZE_LY]; // memory buffer large enough to hold 1 char
+
+        for (int i = 0; i < MAX_CHAR_SIZE_LX * MAX_CHAR_SIZE_LY; i++) buffer[i] = col_bg; // clear to the background color
+
+        int min_x, min_y, max_x, max_y, xa; 
+        _measureChar(c, 0, 0, min_x, max_x, min_y, max_y, pfont, xa); // find out the dimension of the char
+
+        max_x -= min_x;         // set top left corner at (0,0)
+        int nx = -min_x;        //
+        min_x = 0;              // 
+        max_y -= min_y;         //
+        int ny = -min_y;        //
+        min_y = 0;              //
+
+        _drawCharILI(c, nx, ny, col, pfont, MAX_CHAR_SIZE_LX, MAX_CHAR_SIZE_LY, MAX_CHAR_SIZE_LX, buffer, 1.0f); // draw the char on the buffer
+        _updateRectNow(buffer, pos_x, pos_x + max_x , pos_y - ny, pos_y + max_y - ny, MAX_CHAR_SIZE_LX); // upload it to the screen
+
+        pos_x += xa; //(nx + min_x);
+
+        }
+
+
+
+
+
+
+
+
+
+    FLASHMEM void ILI9341Driver::overlayText(uint16_t* fb, const char* text, int position, int line, int font_size,
+                                             uint16_t fg_color, float fg_opacity,
+                                             uint16_t bg_color, float bg_opacity,
+                                             bool extend_bk_whole_width)
+        {
+
+        const ILI9341_t3_font_t * pfont;
+        if (font_size < 12)
+            pfont = &font_ILI9341_T4_OpenSans_Bold_10;
+        else if (font_size < 14)
+            pfont = &font_ILI9341_T4_OpenSans_Bold_12;
+        else if (font_size < 16)
+            pfont = &font_ILI9341_T4_OpenSans_Bold_14;
+        else 
+            pfont = &font_ILI9341_T4_OpenSans_Bold_16;
+
+        int x = 0;
+        int y = 0;
+        int tt_xmin, tt_xmax, tt_ymin, tt_ymax;
+        _measureText(text, x, y, tt_xmin, tt_xmax, tt_ymin, tt_ymax, pfont, false);
+
+        tt_xmin--;
+        tt_xmax++;
+
+        int dx, dy;
+        switch (position)
+            {
+            case 1: 
+                {
+                dx = _width - 1 - tt_xmax;
+                dy = _height - 1 - tt_ymax - line * pfont->line_space;
+                break;
+                }
+            case 2:
+                {
+                dx = -tt_xmin;
+                dy = _height - 1 - tt_ymax - line * pfont->line_space;
+                break;
+                }
+            case 3:
+                {
+                dx = -tt_xmin;
+                dy = -tt_ymin + line * pfont->line_space;
+                break;
+                }
+            default:
+                {
+                dx = _width - 1 - tt_xmax;
+                dy = -tt_ymin + line* pfont->line_space;
+                break;
+                }
+            }
+
+        x += dx;
+        y += dy;
+
+        tt_xmin += dx;
+        tt_xmax += dx;
+        tt_ymin += dy;
+        tt_ymax += dy;
+
+        if (extend_bk_whole_width)
+            { // overwrite
+            tt_xmin = 0; 
+            tt_xmax = _width - 1;
+            }
+
+        _fillRect(tt_xmin, tt_xmax, tt_ymin, tt_ymax, _width, _height, _width, fb, bg_color, bg_opacity);
+        _drawTextILI(text, x, y, fg_color, pfont, false, _width, _height, _width, fb, fg_opacity);
+        }
+
+
+
+
+    FLASHMEM void ILI9341Driver::overlayFPS(uint16_t* fb, int position, uint16_t fg_color, uint16_t bg_color, float opacity)
+        {
+        char text[8] = "--- FPS";
+        int text_off = 0;
+        int fps = statsCurrentFPS();
+        if (fps > 999) fps = 999;
+        if (fps > 0)
+            {
+            text_off = 2;
+            text[text_off] = '0' + (fps % 10);
+            if (fps >= 10)
+                {
+                text_off--;
+                fps /= 10; 
+                text[text_off] = '0' + (fps % 10);
+                }
+            if (fps >= 10)
+                {
+                text_off--;
+                fps /= 10; 
+                text[text_off] = '0' + (fps % 10);
+                }
+            }
+        overlayText(fb, text + text_off, position, 0, 10, fg_color, opacity + 0.3f, bg_color, opacity, false);  
+        }
+
+
+
+
+
+    /**********************************************************************************************************
+    * Statistics
+    ***********************************************************************************************************/
+
+
+    FLASHMEM void ILI9341Driver::statsReset()
+        {
+        _stats_nb_frame = 0;
+        _stats_elapsed_total = 0;       
+        _statsvar_cputime.reset();
+        _statsvar_uploadtime.reset();
+        _statsvar_uploaded_pixels.reset(); 
+        _statsvar_transactions.reset();
+        _statsvar_margin.reset(); 
+        _statsvar_vsyncspacing.reset();
+        _nbteared = 0;       
+
+        _stats_current_fps = -1;
+        _statsvar_fps.reset();
+        _fps_ticks = 0; 
+        _fps_counter = 0;
+        }
+
+
+    FLASHMEM void ILI9341Driver::printStats(bool diff_stats) const
+        {
+        if (_outputStream)
+            {
+            //_waitUpdateAsyncComplete();
+            auto printFloat = [this](float value, int digits)
+                {
+                _outputStream->print(value, digits);
+                };
+
+            _print("----------------- ILI9341Driver Stats ----------------\n");
+
+            _print("[Hardware]\n");
+            _print("- SPI BUS            : SPI");
+            _print(_spi_num);
+            _print(" [MOSI=");
+            _print(_mosi);
+            _print(" , MISO=");
+            _print(_miso);
+            _print(", SCK=");
+            _print(_sclk);
+            _print(", CS=");
+            _print(_cs);
+            _print("]\n");
+
+            _print("- DC pin             : ");
+            _print(_dc);
+            _print(' ');
+            if (_hardware_dc)
+                {
+                _print(" *** Hardware acceleration enabled ***\n");
+                }
+            else
+                {
+                _print('\n');
+                }
+            _print("- SPI speed          : write=");
+            _print(_spi_clock);
+            _print("  read=");
+            _print(_spi_clock_read);
+            _print('\n');
+            _print("- IRQ priority       : ");
+            _print(_irq_priority);
+            _print('\n');
+
+            _print( "- XPT2046 Touchscreen: ");
+            if (_touch_cs == 255)
+                {
+                _print("not connected\n");
+                }
+            else
+                {
+                _print("enabled [TOUCH_CS=");
+                _print(_touch_cs);
+                _print(", TOUCH_IRQ=");
+                _print(_touch_irq);
+                _print("]\n");
+                }
+
+            _print("\n[Configuration]\n");
+            _print("- screen orientation : ");
+            switch (getRotation())
+                {
+                case 0: _print("0 (PORTRAIT_240x320)\n"); break;
+                case 1: _print("1 (LANDSCAPE_320x240)\n"); break;
+                case 2: _print("2 (PORTRAIT_240x320_FLIPPED)\n"); break;
+                case 3: _print("3 (LANDSCAPE_320x240_FLIPPED)\n"); break;
+                }
+
+            _print("- refresh rate       : ");
+            printFloat(getRefreshRate(), 1);
+            _print("Hz  (mode ");
+            _print(getRefreshMode());
+            _print(")\n");
+            int m = bufferingMode();
+            _print("- buffering mode     : ");
+            _print(m);
+            switch (m)
+                {
+                case NO_BUFFERING:  _print(" (NO BUFFERING)\n"); break;
+                case DOUBLE_BUFFERING: _print(" (DOUBLE BUFFERING)\n"); break;
+                }
+            _print("- vsync_spacing      : ");
+            _print(_vsync_spacing);
+            _print(' ');
+            if (_miso == 255)
+                {
+                _print(" (VSYNC ALWAYS DISABLED BECAUSE MISO_PIN=255).\n");
+                }
+            else
+                {
+                if (_vsync_spacing <= 0)
+                    _print(" (VSYNC DISABLED).\n");
+                else
+                    _print(" (VSYNC ENABLED).\n");
+                }
+
+            _print("- requested FPS      : ");
+            if (_vsync_spacing == -1)
+                _print("max fps [drop frames when busy]\n");
+            else if (_vsync_spacing == 0)
+                _print("max fps [do not drop frames]\n");
+            else
+                {
+                printFloat(getRefreshRate() / _vsync_spacing, 1);
+                _print("Hz [=refresh_rate/vsync_spacing]\n");
+                }
+
+            if (diffUpdateActive())
+                {
+                if (_diff2)
+                    {
+                    _print("- diff. updates      : ENABLED - 2 diffs buffers.\n");
+                    }
+                else
+                    {
+                    _print("- diff. updates      : ENABLED - 1 diff buffer.\n");
+                    }
+                _print("- diff [gap]         : ");
+                _print(_diff_gap);
+                _print('\n');
+                if (_compare_mask == 0)
+                    {
+                    _print("- diff [compare_mask]: STRICT COMPARISON.");
+                    }
+                else
+                    {
+                    _print("- diff [compare_mask]: R=");
+                    for (int i = 15; i >= 11; i--) { _print(bitRead(_compare_mask, i) ? '1' : '0'); }
+                    _print(" G=");
+                    for (int i = 10; i >= 5; i--) { _print(bitRead(_compare_mask, i) ? '1' : '0'); }
+                    _print(" B=");
+                    for (int i = 4; i >= 0; i--) { _print(bitRead(_compare_mask, i) ? '1' : '0'); }
+                    }
+                }
+            else
+                {
+                if (_diff1 == nullptr)
+                    _print("- diff. updates      : DISABLED.\n");
+                else
+                    _print("- differential update: DISABLED [ONLY 1 DIFF BUFFER PROVIDED WHEN 2 ARE NEEDED WITH TRIPLE BUFFERING]\n");
+                }
+
+            _print("\n\n[Statistics]\n");
+            _print("- average framerate  : ");
+            printFloat(statsFramerate(), 1);
+            _print(" FPS  (");
+            _print(statsNbFrames());
+            _print(" frames in ");
+            _print(statsTotalTime());
+            _print("ms)\n");
+
+            _print("- instant. framerate : ");
+            _print(statsCurrentFPS());
+            _print(" FPS  [min=");
+            _print(statsFPS().min());
+            _print(" , max=");
+            _print(statsFPS().max());
+            _print("] std=");
+            printFloat(statsFPS().std(), 1);
+            _print('\n');
+
+            const float upload_time = _statsvar_uploadtime.avg();
+            const float upload_rate = (upload_time > 0.0f) ? (1000000.0f / upload_time) : 0.0f;
+            if (diffUpdateActive())
+                {
+                _print("- upload rate        : ");
+                printFloat(upload_rate, 1);
+                _print(" FPS  (");
+                printFloat(statsDiffSpeedUp(), 2);
+                _print("x compared to full redraw)\n");
+                }
+            else
+                {
+                _print("- upload rate        : ");
+                printFloat(upload_rate, 1);
+                _print(" FPS\n");
+                }
+            _print("- upload time / frame: "); _statsvar_uploadtime.print("us", "\n", _outputStream);
+            _print("- CPU time / frame   : "); _statsvar_cputime.print("us", "\n", _outputStream);
+            _print("- pixels / frame     : "); _statsvar_uploaded_pixels.print("", "\n", _outputStream);
+            _print("- transact. / frame  : "); _statsvar_transactions.print("", "\n", _outputStream);
+            if (_vsync_spacing > 0)
+                {
+                _print("- teared frames      : ");
+                _print(statsNbTeared());
+                _print(" (");
+                printFloat(100 * statsRatioTeared(), 1);
+                _print("%)\n");
+                _print("- real vsync spacing : "); _statsvar_vsyncspacing.print("", "\n", _outputStream, true);
+                _print("- margin / frame     : "); _statsvar_margin.print("", "\n", _outputStream);
+                }
+            _print("\n");
+
+            if (diff_stats)
+                {
+                if (_diff1)
+                    {
+                    _print("First diff buffer:\n"); 
+                    _diff1->printStats(_outputStream);
+                    }
+                if (_diff2)
+                    {
+                    _print("Second diff buffer:\n");
+                    _diff2->printStats(_outputStream);
+                    }
+                }
+            _print("------------------------------------------------------\n\n");
+            }
+        }
+
+
+
+    FLASHMEM void ILI9341Driver::_endframe()
+        {
+        _fps_ticks++;
+        const uint32_t tfps = _fps_counter;
+        if (tfps > 1000)
+            {
+            uint32_t new_fps = roundf((1000.0f * _fps_ticks) / tfps);
+            if (_stats_current_fps > 0)
+                {                
+                _statsvar_fps.push(new_fps);
+                }
+            _stats_current_fps = new_fps;
+            _fps_counter = 0;
+            _fps_ticks = 0; 
+            }
+
+        _stats_nb_frame++;
+
+        _stats_cputime += _stats_elapsed_cputime;
+        _statsvar_cputime.push(_stats_cputime);
+
+        _stats_uploadtime += _stats_elapsed_uploadtime;
+        _statsvar_uploadtime.push(_stats_uploadtime);
+
+        _statsvar_uploaded_pixels.push(_stats_nb_uploaded_pixels);
+
+        _statsvar_transactions.push(_stats_nb_transactions);
+
+        if (_vsync_spacing > 0)
+            {
+            if (_statsvar_margin.count() > 0) _statsvar_vsyncspacing.push(_last_delta);
+
+            if (_margin < 0) _nbteared++;
+
+            _statsvar_margin.push(_margin);
+            }
+        }
+
+
+
+
+
+
+
+
+    /**********************************************************************************************************
+    * Touch
+    ***********************************************************************************************************/
+
+
+    ILI9341Driver* volatile ILI9341Driver::_touchObjects[4] = { nullptr, nullptr, nullptr, nullptr };
+
+
+    /** set the touch interrupt routine */
+    FLASHMEM void ILI9341Driver::_setTouchInterrupt()
+        {
+        _touch_z_threshold = ILI9341_T4_TOUCH_Z_THRESHOLD;
+        _touch_has_calibration = false;
+
+        _touch_request_read = false;
+        _touched = true;;
+        _touched_read = true;
+        _touch_x = _touch_y = _touch_z = 0;
+
+        bool slotfound = false;
+        if ((_touch_irq >= 0) && (_touch_irq < 42)) // valid digital pin
+            {
+            pinMode(_touch_irq, INPUT);
+            if ((!slotfound) && (_touchObjects[0] == nullptr)) { _touchObjects[0] = this; attachInterrupt(_touch_irq, _touch_int0, FALLING); slotfound = true; }
+            if ((!slotfound) && (_touchObjects[1] == nullptr)) { _touchObjects[1] = this; attachInterrupt(_touch_irq, _touch_int1, FALLING); slotfound = true; }
+            if ((!slotfound) && (_touchObjects[2] == nullptr)) { _touchObjects[2] = this; attachInterrupt(_touch_irq, _touch_int2, FALLING); slotfound = true; }
+            if ((!slotfound) && (_touchObjects[3] == nullptr)) { _touchObjects[3] = this; attachInterrupt(_touch_irq, _touch_int3, FALLING); slotfound = true; }
+            }
+        if (!slotfound) { _touch_irq = 255; } // disable touch irq
+        }
+
+
+    int32_t ILI9341Driver::lastTouched()
+        {
+        const bool b = _touched;
+        _touched = false;
+        return (b && (_touch_irq != 255)) ? ((int32_t)_em_touched_irq) : -1;
+        }
+
+
+    FLASHMEM void ILI9341Driver::_updateTouch2()
+        {
+        int16_t data[6] = { 0,0,0,0,0,0};
+        int z = 0;
+
+        if (_touch_cs != 255)
+            {
+            _pspi->beginTransaction(SPISettings(_spi_clock_read, MSBFIRST, SPI_MODE0));
+            digitalWrite(_touch_cs, LOW);
+            _pspi->transfer(0xB1);
+            int16_t z1 = _pspi->transfer16(0xC1 /* Z2 */) >> 3;
+            z = z1 + 4095;
+            int16_t z2 = _pspi->transfer16(0x91 /* X */) >> 3;
+            z -= z2;
+            if (z >= _touch_z_threshold)
+                {
+                _pspi->transfer16(0x91 /* X */);  // dummy X measure, 1st is always noisy
+                data[0] = _pspi->transfer16(0xD1 /* Y */) >> 3;
+                data[1] = _pspi->transfer16(0x91 /* X */) >> 3; // make 3 x-y measurements
+                data[2] = _pspi->transfer16(0xD1 /* Y */) >> 3;
+                data[3] = _pspi->transfer16(0x91 /* X */) >> 3;
+                } else
+                {
+                data[0] = data[1] = data[2] = data[3] = 0;  // Compiler warns these values may be used unset on early exit.
+                }
+            data[4] = _pspi->transfer16(0xD0 /* Y */) >> 3; // Last Y touch power down
+            data[5] = _pspi->transfer16(0) >> 3;
+            digitalWrite(_touch_cs, HIGH);
+            _pspi->endTransaction();
+            }
+
+        if (z < _touch_z_threshold)
+            {
+            _touch_z = 0;
+            if (z < ILI9341_T4_TOUCH_Z_THRESHOLD_INT)
+                {
+                if (_touch_irq != 255) _touched_read = false;
+                }
+            return;
+            }
+
+        int x = _besttwoavg(data[1], data[3], data[5]);
+        int y = _besttwoavg(data[0], data[2], data[4]);
+
+        _touch_x = x;
+        _touch_y = y;
+        _touch_z = z;
+        _em_touched_read = 0; // good read completed, set wait
+        }
+
+
+    FLASHMEM void ILI9341Driver::_updateTouch()
+        {
+        if (_em_touched_read < ILI9341_T4_TOUCH_MSEC_THRESHOLD) return; // read not so long ago
+        if ((_touch_irq != 255) && (_touched_read == false)) return; // nothing to do. 
+        if (asyncUpdateActive())
+            {
+            _touch_request_read = true; // request read at end of transfer
+            elapsedMillis em = 0;
+            while ((_touch_request_read) && (asyncUpdateActive())) // wait until transfer complete or reading done. 
+                {
+                if (em > 1000)
+                    {
+                    _touch_request_read = false;
+                    return;
+                    }
+                }
+            if (!_touch_request_read) return; // reading was done, nothing to do. 
+            _touch_request_read = false; // remove request. 
+            }
+        // we can do the reading now
+        _updateTouch2();
+        return;
+        }
+
+
+
+    FLASHMEM bool ILI9341Driver::readTouch(int& x, int& y, int& z)
+        {
+        if (_touch_cs == 255) return false; // touchscreen is not configured. 
+        _updateTouch();
+        if (_touch_z < _touch_z_threshold) return false;
+        z = _touch_z;
+        if (_touch_has_calibration)
+            { // coord in orientation 0. 
+            int xx  = _mapTouchX(_touch_x, _touch_calib[0], _touch_calib[1]);
+            int yy = _mapTouchY(_touch_y, _touch_calib[2], _touch_calib[3]); 
+            switch (_rotation)
+                {
+            case 0:
+                x = xx;
+                y = yy;
+                break;
+            case 1:
+                x = yy;
+                y = ILI9341_T4_TFTWIDTH - 1 - xx;
+                break;
+            case 2:
+                x = ILI9341_T4_TFTWIDTH - 1 - xx;
+                y = ILI9341_T4_TFTHEIGHT - 1 - yy;
+                break;
+            case 3:
+                x = ILI9341_T4_TFTHEIGHT - 1 - yy;
+                y = xx;
+                break;
+                }
+            }
+        else
+            { // raw values
+            x = _touch_x;
+            y = _touch_y;
+            }
+        return true;
+        }
+
+
+    FLASHMEM bool ILI9341Driver::readTouch(int& x, int& y)
+        {
+        int z;
+        return readTouch(x, y, z);
+        }
+
+
+    FLASHMEM int16_t ILI9341Driver::_besttwoavg(int16_t x, int16_t y, int16_t z)
+        {
+        int16_t da, db, dc;
+        int16_t reta = 0;
+        if (x > y) da = x - y; else da = y - x;
+        if (x > z) db = x - z; else db = z - x;
+        if (z > y) dc = z - y; else dc = y - z;
+        if (da <= db && da <= dc) reta = (x + y) >> 1;
+        else if (db <= da && db <= dc) reta = (x + z) >> 1;
+        else reta = (y + z) >> 1;   //    else if ( dc <= da && dc <= db ) reta = (x + y) >> 1;
+        return (reta);
+        }
+
+
+    FLASHMEM void ILI9341Driver::setTouchCalibration(const int touchCalibration[4])
+        {
+        if (touchCalibration)
+            {
+            _touch_has_calibration = true;
+            for (int i = 0; i < 4; i++) _touch_calib[i] = touchCalibration[i];
+            }
+        else
+            {
+            _touch_has_calibration = false;
+            }
+        }
+
+
+    FLASHMEM bool ILI9341Driver::getTouchCalibration(int touchCalibration[4])
+        {
+        if (_touch_has_calibration)
+            {
+            for (int i = 0; i < 4; i++) touchCalibration[i] = _touch_calib[i];
+            return true;
+            }
+        else
+            {
+            return false;
+            }
+        }
+
+
+
+    FLASHMEM void ILI9341Driver::_calibRect(int cx, int cy, int R, uint16_t col_ext, uint16_t col_int)
+        {
+        const int R1 = R / 2;
+        _pushRect(col_ext, cx - R, cx + R, cy - R, cy + R);
+        _pushRect(col_int, cx - R1, cx + R1, cy - R1, cy + R1);
+        const int dx = (cx > 120) ? -1 : 1;
+        const int dy = (cy > 160) ? -1 : 1;
+        for (int k = 0; k < 8 * R; k++)
+            {
+            _pushRect(col_ext, cx + (R + 1 + k)*dx, cx + (R + 1 + k) * dx + 1, cy + (R + 1 + k) * dy, cy + (R + 1 + k) * dy + 1);
+            }
+        }
+
+
+    FLASHMEM void ILI9341Driver::_calibTouch(int& x, int& y, int& z, int prv_x, int prv_y)
+        {
+        const int NB_SAMPLE = 3;
+        const int MIN_DIST = 500;
+        do 
+            {
+            _updateTouch();
+            delay(10);
+            } 
+        while (_touch_z > 0);
+
+        while (1)
+            {
+            int nbs = 0;
+            x = 0;
+            y = 0;
+            while(nbs < NB_SAMPLE)
+                {
+                _touch_z = 0;            
+                _updateTouch();
+                if (_touch_z >= _touch_z_threshold)
+                    {
+                    nbs++;
+                    x += _touch_x;
+                    y += _touch_y;
+                    } 
+                delay(10);
+                }
+            x /= NB_SAMPLE;
+            y /= NB_SAMPLE;
+            if (((abs(x - prv_x) > MIN_DIST) || (prv_x < 0)) || ((abs(y - prv_y) > MIN_DIST) || (prv_y < 0))) return;
+            }
+        }
+
+
+    FLASHMEM void ILI9341Driver::calibrateTouch(int touchCalibration[4])
+        {
+        if (_touch_cs == 255)
+            {
+            _print("\nERROR: Called calibrateTouch() but touchscreen not connected... Aborting.\n\n");
+            return;
+            }
+
+        _waitUpdateAsyncComplete();
+
+        int oldrot = getRotation(); 
+        setRotation(0); 
+
+        const uint16_t BLACK = 0;
+        const uint16_t WHITE = 0xFFFF;
+        const uint16_t GREY = 25 + (25 << 11) + (51 << 5);
+        const uint16_t RED = 31 << 11;
+        const uint16_t BLUE = 31;
+        const uint16_t GREEN = 50 << 5;
+        const int RADIUS = 6;
+
+        _print("\n\n------------- Touch Calibration ---------------\n");
+
+    restart_calib:
+
+        int x[4] = {0,0,0,0};
+        int y[4] = {0,0,0,0};
+        int z[4] = {0,0,0,0};
+
+        for (int i = 0; i < 4; i++)
+            {
+            char tn[4] = { (char)('1' + i),'/', '4', 0};
+            clear(WHITE);         
+            _uploadText("Touchscreen calibration", 28, 120, BLACK, WHITE, (void*)(&font_ILI9341_T4_OpenSans_Bold_16), true);
+            _uploadText("Touch the center of the", 50, 170, BLUE, WHITE, (void*)(&font_ILI9341_T4_OpenSans_Bold_12), true);
+            _uploadText("red square in the corner", 47, 185, BLUE, WHITE, (void*)(&font_ILI9341_T4_OpenSans_Bold_12), true);
+            _uploadText(tn, 105, 215, 31, 0xFFFF, (void*)(&font_ILI9341_T4_OpenSans_Bold_16), true);            
+            _print("\n- corner ");
+            _print(tn);
+            _print(": touch the center of the red rectangle... ");
+            switch (i)
+                {
+                case 0:
+                    _calibRect(ILI9341_T4_TFTWIDTH - 1 - RADIUS, ILI9341_T4_TFTHEIGHT - 1 - RADIUS, RADIUS, BLUE, RED);
+                    break;
+
+                case 1:
+                    _calibRect(RADIUS, ILI9341_T4_TFTHEIGHT - 1 - RADIUS, RADIUS, BLUE, RED);
+                    break;
+
+                case 2:
+                    _calibRect(RADIUS, RADIUS, RADIUS, BLUE, RED);
+                    break;
+
+                case 3:
+                    _calibRect(ILI9341_T4_TFTWIDTH - 1 - RADIUS, RADIUS, RADIUS, BLUE, RED);
+                    break;
+                }
+            int j = (i + 2) % 4;
+            delay(200);
+            _calibTouch(x[j], y[j], z[j]);
+            _print("\n");
+            _print(x[j]);
+            _print("  ");
+            _print(y[j]);
+            _print("  ");
+            _print(z[j]);
+            _print("\n");
+            }
+
+        clear(WHITE);  
+        _pushRect(BLACK, 2, 93, 280, 318);
+        _pushRect(GREY, 4, 91, 282, 316);
+        _pushRect(BLACK, 97, 237, 280, 318);
+        _pushRect(GREY, 99, 235, 282, 316);
+        _uploadText("GOOD", 27, 305, GREEN, GREY, (void*)(&font_ILI9341_T4_OpenSans_Bold_14), true);
+        _uploadText("REDO CALIB.", 130, 305, RED, GREY, (void*)(&font_ILI9341_T4_OpenSans_Bold_14), true);
+        _uploadText("Draw below to test calibration", 19, 15, BLACK, WHITE, (void*)(&font_ILI9341_T4_OpenSans_Bold_14), true);
+
+        float xa = (x[0] + x[3]) / 2.0f;
+        float xb = (x[1] + x[2]) / 2.0f;
+        float ya = (y[0] + y[1]) / 2.0f;
+        float yb = (y[2] + y[3]) / 2.0f;
+        
+        const float xc = (xa + xb) / 2;
+        const float ex = ((float)ILI9341_T4_TFTWIDTH) / (ILI9341_T4_TFTWIDTH - 2*RADIUS);
+        xa = xc + (xa - xc) * ex;
+        xb = xc + (xb - xc) * ex;
+
+        const float yc = (ya + yb) / 2;
+        const float ey = ((float)ILI9341_T4_TFTHEIGHT) / (ILI9341_T4_TFTHEIGHT - 2*RADIUS);
+        ya = yc + (ya - yc) * ey;
+        yb = yc + (yb - yc) * ey;
+
+        int touch_calib[4];
+        touch_calib[0] = (int)roundf(xa);
+        touch_calib[1] = (int)roundf(xb);
+        touch_calib[2] = (int)roundf(ya);
+        touch_calib[3] = (int)roundf(yb);
+
+        setTouchCalibration(touch_calib);
+        if (touchCalibration)
+            {
+            for (int i = 0; i < 4; i++) touchCalibration[i] = touch_calib[i];
+            }
+
+        while (1)
+            {
+            delay(1);
+            int x, y, z;
+            if (readTouch(x, y, z))
+                {
+                if (y > 283)
+                    {
+                    if (x < 95)
+                        {
+                        // done !
+                        _print("\n\nDONE !");
+                        _print("\n\nCalibration values = {");
+                        _print(touch_calib[0]);
+                        _print(", ");
+                        _print(touch_calib[1]);
+                        _print(", ");
+                        _print(touch_calib[2]);
+                        _print(", ");
+                        _print(touch_calib[3]);
+                        _print(" }\n\n");
+                        
+                        clear(WHITE);
+
+                        char tt[50] = { 0 };
+                        char* p = tt;
+                        const char* const end = tt + sizeof(tt) - 1;
+                        const auto appendText = [&](const char* s)
+                            {
+                            while ((*s) && (p < end)) *p++ = *s++;
+                            };
+                        const auto appendInt = [&](int v)
+                            {
+                            char b[12];
+                            itoa(v, b, 10);
+                            appendText(b);
+                            };
+                        appendText("{ ");
+                        appendInt(touch_calib[0]);
+                        appendText(" ,  ");
+                        appendInt(touch_calib[1]);
+                        appendText(" ,  ");
+                        appendInt(touch_calib[2]);
+                        appendText(" ,  ");
+                        appendInt(touch_calib[3]);
+                        appendText(" }");
+                        *p = 0;
+
+                        int minx, maxx, miny, maxy;
+                        _measureText(tt, 0, 0, minx, maxx, miny, maxy, (void*)(&font_ILI9341_T4_OpenSans_Bold_16), false);
+                        _uploadText("Calibration data:", 50, 130, BLACK, WHITE, (void*)(&font_ILI9341_T4_OpenSans_Bold_16), true);
+                        _uploadText(tt, 120 - (maxx - minx + 1)/2, 170, RED, WHITE, (void*)(&font_ILI9341_T4_OpenSans_Bold_16), true);
+                        _pushRect(BLACK, 85, 155, 280, 318);
+                        _pushRect(GREY, 87, 153, 282, 316);
+                        _uploadText("QUIT", 102, 305, BLACK, GREY, (void*)(&font_ILI9341_T4_OpenSans_Bold_16), true);
+                        delay(300);
+
+                        while (1)
+                            {
+                            if (readTouch(x, y, z))
+                                {
+                                if ((y > 283) && (x > 87) && (x < 153))
+                                    {                                    
+                                    setRotation(oldrot);
+                                    _mirrorfb = nullptr;
+                                    _ongoingDiff = nullptr;
+                                    resync();
+                                    return;
+                                    }
+                                }
+                            }
+                        }
+                    else
+                        {                        
+                        _print("\n\nrestarting calibration procedure...\n\n");
+                        goto restart_calib;
+                        }
+                    }
+                else
+                    {
+                    _pushRect(BLACK, x - 2, x + 2, y - 2, y + 2);
+                    }
+                }
+            }
+        }
+
+
+
+
+
+}
+
+
+/** end of file */
+
