@@ -161,15 +161,24 @@ static const char* fmtValue(char* buf, size_t n, float v, uint8_t decimals, bool
     }
 
 // Freshness gates for DISPLAY, mirroring the gates alarms.cpp uses for
-// judging: same source groups, same windows, so a value and its alarm can
+// judging: same source frames, same window, so a value and its alarm can
 // never disagree about whether the data is real.
-static bool oilFresh()  { return g_data.ecuGroupFresh(13, ECU_FRESH_FAST_MS); }
-static bool cltFresh()  { return g_data.ecuGroupFresh(2,  ECU_FRESH_FAST_MS); }
-static bool voltFresh() { return g_data.ecuGroupFresh(3,  ECU_FRESH_FAST_MS); }
+static bool oilFresh()  { return g_data.ecuFrameFresh(ECU_F_SENSORS2); }
+static bool cltFresh()  { return g_data.ecuFrameFresh(ECU_F_SENSORS1); }
+static bool voltFresh() { return g_data.ecuFrameFresh(ECU_F_SENSORS2); }
+
+// Lambda additionally needs a real reading: rusEFI broadcasts 0 while the
+// wideband warms up (or has failed), and "0.00" on the gauge would look
+// like a catastrophically rich engine.
+static bool lambdaFresh()
+    {
+    return g_data.ecuFrameFresh(ECU_F_LAMBDA) && g_data.ecu.lambda >= LAMBDA_SENSOR_MIN;
+    }
 
 // Square-wave flash phase from the shared millis() clock - same convention
-// as led_tach.cpp: wall time, not a counter, so every flashing element in
-// the gauge (banner AND strip) blinks in phase.
+// as led_tach.cpp: wall time, not a counter, so flashing elements never
+// drift against each other. (They don't share a RATE: the banner flashes at
+// 1 Hz, the strip's red at ~2 Hz - see the *_FLASH_HALF_MS constants.)
 static bool flashOn(uint32_t halfPeriodMs)
     {
     return (millis() / halfPeriodMs) & 1;
@@ -449,12 +458,12 @@ static void renderPsiLambda(tgx::Image<tgx::RGB565>& im, const Theme& t)
 
     drawLambdaSymbol(im, 342, 18, t.green); // the label of the right column
 
-    // The ECU broadcasts AFR; lambda = AFR / stoich is the fuel-agnostic
-    // form the alarms are defined on, so it is also what we display.
-    const bool afrOk = voltFresh(); // AFR rides in the same broadcast group as volts
-    im.drawTextEx(fmtValue(buf, sizeof(buf), g_data.ecu.afr / AFR_STOICH, 2, afrOk),
+    // rusEFI broadcasts lambda directly - the fuel-agnostic form the alarms
+    // are defined on, so it is also what we display.
+    const bool lamOk = lambdaFresh();
+    im.drawTextEx(fmtValue(buf, sizeof(buf), g_data.ecu.lambda, 2, lamOk),
                   {SCREEN_LX - 6, 40}, FONT_VALUE_SM, tgx::Anchor::TOPRIGHT,
-                  false, false, afrOk ? VALUE_COLOR(t, k_afrAlarms) : t.divider);
+                  false, false, lamOk ? VALUE_COLOR(t, k_afrAlarms) : t.divider);
 
     im.drawFastHLine({262, 98}, SCREEN_LX - 270, t.divider);
 
@@ -496,11 +505,11 @@ void gaugeRenderDebug(uint16_t* fb, uint8_t page)
         case 0: // ECU page - plus the top-alarm tag in the corner
             snprintf(line, sizeof(line), "RPM %5u MAP%5.1f", e.rpm, e.mapKpa);
             debugRow(im, t, 0, line);
-            snprintf(line, sizeof(line), "CLT %5.1f MAT%5.1f", e.cltC, e.matC);
+            snprintf(line, sizeof(line), "CLT %5.1f IAT%5.1f", e.cltC, e.matC);
             debugRow(im, t, 1, line);
             snprintf(line, sizeof(line), "OIL %4.1fP %5.1fC", e.oilPressPsi, e.oilTempC);
             debugRow(im, t, 2, line);
-            snprintf(line, sizeof(line), "PW %5.2f DTY%5.1f%%", e.pw1Ms, e.injDutyPct);
+            snprintf(line, sizeof(line), "PW %5.2f DTY%5.1f%%", e.injPwMs, e.injDutyPct);
             debugRow(im, t, 3, line);
 
             if (g_data.alarms.top != ALARM_NONE)
@@ -510,14 +519,15 @@ void gaugeRenderDebug(uint16_t* fb, uint8_t page)
             break;
 
         case 1: // mixture + electrical page
-            snprintf(line, sizeof(line), "AFR %4.1f TGT %4.1f", e.afr, e.afrTarget);
+            snprintf(line, sizeof(line), "LAM %5.3f T%5.3f", e.lambda, e.lambdaTarget);
             debugRow(im, t, 0, line);
-            snprintf(line, sizeof(line), "ERR%+6.3f EGO%+5.1f", e.lambdaErr2s, e.egoCorPct);
+            // '*' = the mixture window is full and the AFR alarms are judging it
+            snprintf(line, sizeof(line), "ERR%+6.3f%c TRM%+5.1f", e.lambdaErr2s,
+                     e.lambdaJudgeable ? '*' : ' ', e.egoCorPct);
             debugRow(im, t, 1, line);
             snprintf(line, sizeof(line), "VLT %4.1f ADV %4.1f", e.battVolts, e.sparkAdvDeg);
             debugRow(im, t, 2, line);
-            snprintf(line, sizeof(line), "ENG x%02X FRM%7lu", e.engineBits,
-                     (unsigned long)e.frameCount);
+            snprintf(line, sizeof(line), "ST x%02X CODE%5u", e.statusBits, e.lastError);
             debugRow(im, t, 3, line);
             break;
 

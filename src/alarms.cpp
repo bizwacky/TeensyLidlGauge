@@ -42,9 +42,9 @@ static bool engineRunning()
     return g_data.ecuOnline() && g_data.ecu.rpm > ENGINE_RUNNING_RPM;
     }
 
-static bool oilDataOk()  { return g_data.ecuGroupFresh(13, ECU_FRESH_FAST_MS); } // sensors
-static bool cltDataOk()  { return g_data.ecuGroupFresh(2,  ECU_FRESH_FAST_MS); } // baro/map/mat/clt
-static bool voltDataOk() { return g_data.ecuGroupFresh(3,  ECU_FRESH_FAST_MS); } // tps/batt/afr
+static bool oilDataOk()  { return g_data.ecuFrameFresh(ECU_F_SENSORS2); } // oil P/T + volts
+static bool cltDataOk()  { return g_data.ecuFrameFresh(ECU_F_SENSORS1); } // MAP/CLT/IAT
+static bool voltDataOk() { return g_data.ecuFrameFresh(ECU_F_SENSORS2); }
 static bool cellDataOk() { return g_data.bmsFrameFresh(BMS_F_CELLS, BMS_OFFLINE_MS); }
 
 // The sender estimate counts only with healthy wiring AND a primed slosh
@@ -119,26 +119,30 @@ static bool condCltCold(bool on)
     return cltDataOk() && below(g_data.ecu.cltC, CLT_COLD_C, TEMP_HYST_C, on);
     }
 
-// AFR alarms run on the 2-second-averaged lambda error (computeDerived()),
-// which is 0 whenever the engine isn't running or the data is invalid - so
-// they self-gate and only the MAP check needs an extra freshness test.
+// AFR alarms judge the gated two-second window from mixture.cpp, and only
+// once it is full (lambdaJudgeable): engine running, data fresh, throttle
+// open, no fuel cut, sensor recovered - all already proven there. The red
+// also needs the WHOLE window under load, so it can never fire on overrun
+// history the way the old MAP-at-this-instant test did.
 static bool condAfrLeanCrit(bool on)
     {
-    return engineRunning() && cltDataOk() // cltDataOk = group 2 = MAP source
-        && above(g_data.ecu.lambdaErr2s, LAMBDA_LEAN_CRIT, LAMBDA_HYST, on)
-        && g_data.ecu.mapKpa > LAMBDA_CRIT_MIN_MAP;
+    const EcuData& e = g_data.ecu;
+    return e.lambdaJudgeable && e.lambdaUnderLoad
+        && above(e.lambdaErr2s, LAMBDA_LEAN_CRIT, LAMBDA_HYST, on);
     }
 
 static bool condAfrLeanWarn(bool on)
     {
-    return engineRunning()
-        && above(g_data.ecu.lambdaErr2s, LAMBDA_LEAN_WARN, LAMBDA_HYST, on);
+    const EcuData& e = g_data.ecu;
+    return e.lambdaJudgeable
+        && above(e.lambdaErr2s, LAMBDA_LEAN_WARN, LAMBDA_HYST, on);
     }
 
 static bool condAfrRich(bool on)
     {
-    return engineRunning()
-        && below(g_data.ecu.lambdaErr2s, -LAMBDA_RICH_DELTA, LAMBDA_HYST, on);
+    const EcuData& e = g_data.ecu;
+    return e.lambdaJudgeable
+        && below(e.lambdaErr2s, -LAMBDA_RICH_DELTA, LAMBDA_HYST, on);
     }
 
 // Voltage alarms watch the alternator, so they only mean something with the
@@ -223,9 +227,13 @@ static bool condBattCan(bool)
     return !g_data.bmsOnline();
     }
 
+// ANY ECU frame the gauge decodes going stale - not just the rpm heartbeat.
+// Losing one frame while the rest flow (a broadcast switched off in
+// TunerStudio, the MS dash type set back to None) would otherwise quietly
+// disarm every alarm fed by it.
 static bool condNoCan(bool)
     {
-    return !g_data.ecuOnline();
+    return !g_data.ecuDataComplete();
     }
 
 // The rotary mode switch reads open-circuit (inputs.cpp already debounced
@@ -240,9 +248,11 @@ static bool condDialFail(bool)
 
 static bool condCranking(bool)
     {
-    // the MS 'engine' bitfield's crank bit - VERIFY on the real ECU
-    return g_data.ecuGroupFresh(1, ECU_FRESH_SLOW_MS)
-        && (g_data.ecu.engineBits & ENGINE_BIT_CRANKING);
+    // rusEFI's broadcast has no cranking flag; turning but below running
+    // speed is the starter. The 300 ms set time in the table keeps a stall
+    // spinning down through this band from flashing CRANKING.
+    return g_data.ecuOnline()
+        && g_data.ecu.rpm > 0 && g_data.ecu.rpm <= ENGINE_RUNNING_RPM;
     }
 
 // --- 3. THE TABLE -------------------------------------------------------------------
@@ -291,7 +301,7 @@ static const AlarmDef k_defs[ALARM_COUNT] =
     { "NO CAN  ", ALARM_YELLOW, 19,  3000,  2000, CLIP_NO_CAN,           0, condNoCan       },
     { "DIALFAIL", ALARM_YELLOW, 20, ROTARY_OPEN_MS, 2000, CLIP_DIAL_FAIL,  0, condDialFail    },
     { "BATTCOLD", ALARM_BLUE,   20,  5000,  5000, CLIP_NONE,             0, condBattCold    },
-    { "CRANKING", ALARM_GREEN,  21,    60,   300, CLIP_NONE,             0, condCranking    },
+    { "CRANKING", ALARM_GREEN,  21,   300,   300, CLIP_NONE,             0, condCranking    },
     { "AFR RICH", ALARM_BLUE,   22,  1000,  2000, CLIP_NONE,             0, condAfrRich     },
     { "CLT COLD", ALARM_BLUE,   23,  2000,  3000, CLIP_NONE,             0, condCltCold     },
     { "OIL COLD", ALARM_BLUE,   24,  2000,  3000, CLIP_NONE,             0, condOilCold     },

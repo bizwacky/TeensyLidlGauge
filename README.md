@@ -2,7 +2,7 @@
 
 Firmware for the E30 rally car gauge cluster: Teensy 4.0 driving three
 ER-TFT2.79-1 displays (NV3007 controller) over SPI, fed by CAN data from the
-RUSEFI ECU and the JK BMS. The full hardware/software plan
+rusEFI ECU (a Super uaEFI) and the JK BMS. The full hardware/software plan
 (`Rally CAN Gauge Project Plan.md`) lives in the local project folder
 alongside the firmware and is not part of this repository.
 
@@ -24,8 +24,8 @@ pio run -e display_test -t upload
 
 ```
 CAN interrupt -> ring buffer -> canBusPoll() ---+
-ADC pins  ------> inputsPoll()  (20 ms tick) ---+--> g_data (raw + derived)
-RTC + die temp -/                                      |
+ADC pins  ------> inputsPoll()  (20 ms tick) ---+--> g_data (raw + derived:
+RTC + die temp -/                                |    mixture window, fuel calc)
                                                  alarmsUpdate()
                                                        v
                                                 g_data.alarms ---> audio (1 Hz),
@@ -41,14 +41,14 @@ no display or audio code ever touches a threshold. The screens repeat the
 same split one level down: `gauge_render.cpp` decides what a frame *shows*
 (pure g_data -> pixels), `screens.cpp` decides how it *reaches the glass*
 (framebuffers, diffs, DMA). The superloop in `src/main.cpp` is a cooperative
-scheduler: CAN drains every pass, inputs + alarms + LED strip + screens run
-on a 20 ms tick (which also feeds the hardware watchdog), housekeeping runs
-at 1 Hz. A hung firmware stops feeding the watchdog and the chip hard-resets
-within ~1 s.
+scheduler: CAN drains every pass, inputs + mixture window + fuel calc +
+alarms + LED strip + screens run on a 20 ms tick (which also feeds the
+hardware watchdog), housekeeping runs at 1 Hz. A hung firmware stops feeding
+the watchdog and the chip hard-resets within ~1 s.
 
 ## Layout
 
-- `src/main.cpp` - the superloop (scheduler + derived values + 1 Hz debug print).
+- `src/main.cpp` - the superloop (scheduler + 1 Hz debug print).
 - `src/config.h` - every pin, constant, threshold and tunable in one place.
 - `src/vehicle_data.h/.cpp` - the central data model (`g_data`), including
   the alarm catalog enum (ordered by the plan's priorities).
@@ -68,9 +68,16 @@ within ~1 s.
   levels. Hardware, frequency and phase rationale in `config.h`; the
   FlexPWM register mechanics and the bench check at the top of the .cpp.
 - `src/watchdog.h/.cpp` - minimal register driver for the i.MX RT's WDOG1.
-- `src/can_bus.h/.cpp` - CAN3 + both decoders: Megasquirt ECU broadcast
-  (big-endian, 50 Hz) and JK BMS Deye protocol (little-endian, 1 Hz), plus
-  the 1 Hz PCS heartbeat the BMS expects from an "inverter".
+- `src/can_bus.h/.cpp` - CAN3 + the decoders: rusEFI's native broadcast
+  (frames BASE0..7, layouts from rusEFI's own DBC), the one target-AFR byte
+  from rusEFI's MS Simplified broadcast, and the JK BMS Deye protocol (1 Hz)
+  - all little-endian - plus the 1 Hz PCS heartbeat the BMS expects from an
+  "inverter". Every frame is counted as decoded, ignored (expected traffic
+  we don't use) or unknown, so a misconfigured bus shows up as `unk=`.
+- `src/mixture.h/.cpp` - the gated two-second lambda window the AFR alarms
+  judge: samples only count while the driver is on the throttle, rusEFI
+  isn't cutting fuel, and the sensor has recovered from the last time that
+  wasn't true - so overrun and fuel cut can't raise AFR LEAN.
 - `src/inputs.h/.cpp` - fuel sender (ratiometric 150R divider, including
   the two-stage slosh filter: median window + slow EMA), rotary switch
   (2.2k pull-up into an 11 x 220R ladder, decoded in ohms, with open-wiper
@@ -112,10 +119,12 @@ within ~1 s.
   `display_test` environment (wiring documented at the top of the file).
 - `docs/FRAM_BLACKBOX.md` - the FM24V10 wiring, memory map, record
   formats, black-box gating rules, and the serial console commands.
-- `docs/ECU_CAN_SETUP.md` - **the TunerStudio broadcast configuration the
-  firmware expects.** Keep it in sync with `config.h`/`can_bus.cpp`.
+- `docs/ECU_CAN_SETUP.md` - **the rusEFI / TunerStudio settings the firmware
+  expects** (broadcast base address, dash type, period), the frame map, and
+  the bring-up checklist. Keep it in sync with `config.h`/`can_bus.cpp`.
 - `docs/BMS_CAN_SETUP.md` - the JK BMS protocol selection (Deye/001), the
-  frames decoded, and BMS bring-up checks.
+  frames decoded, BMS bring-up checks, and the table of every CAN id on the
+  bus.
 - `lib/ILI9341_T4/` - vindar's ILI9341_T4 DMA display library, modified for
   the NV3007 controller. **Read `lib/ILI9341_T4/PORTING_NV3007.md`** for a
   walkthrough of every change and why it was needed. It is vendored from

@@ -253,8 +253,8 @@ static void readBoard()
 
     // TimeLib keeps its own soft clock, resynced from the hardware RTC every
     // few minutes (setSyncProvider below). Until someone actually sets the
-    // clock the RTC reports 1970/2016-ish dates - flag that so the display
-    // phase can show "--:--" instead of a wrong time.
+    // clock the RTC reports 1970/2016-ish dates - flag that so the screens
+    // show "--:--:--" instead of a wrong time.
     g_data.board.clockValid = (year() > 2020);
     g_data.board.hh = (uint8_t)hour();
     g_data.board.mm = (uint8_t)minute();

@@ -92,8 +92,9 @@ static bool flashOn(uint32_t halfPeriodMs)
 // stage's own threshold. A reading hovering at 69.9/70.1 C therefore can't
 // flick LED 6 between blue and live every tick.
 //
-// Fail-safe by construction: with the ECU silent (or the sensor dead) the
-// oil temp reads 0 C -> stage "cold" -> the most restrictive blue block.
+// Fail-safe by construction: with the oil data stale (ECU silent) the
+// caller passes 0 C, and rusEFI itself broadcasts a dead sensor as 0 C ->
+// stage "cold" -> the most restrictive blue block.
 
 static uint16_t warmupRpmLimit(float oilTempC)
     {
@@ -147,10 +148,10 @@ void ledTachUpdate()
     const bool night  = m.night; // affects COLOR choice; brightness is separate
     s_brightness = m.ledBrightness;
 
-    // Trust rpm only while the 50 Hz ECU stream is actually arriving;
+    // Trust rpm only while the ECU's rpm frame is actually arriving;
     // otherwise the bar would freeze at the last value the dead bus sent.
     // (The NO CAN yellow alarm reports the outage - the tach just goes dark.)
-    const uint16_t rpm = g_data.ecuGroupFresh(0, ECU_FRESH_FAST_MS) ? g_data.ecu.rpm : 0;
+    const uint16_t rpm = g_data.ecuOnline() ? g_data.ecu.rpm : 0;
 
     // --- priority 1: red alarm -> the whole gauge flashes red ------------------
     // Silent mode opts out (plan: "disables flashing") and is handled as a
@@ -197,7 +198,8 @@ void ledTachUpdate()
         }
     else
         {
-        const uint16_t limit = warmupRpmLimit(g_data.ecu.oilTempC);
+        const float    oilT  = g_data.ecuFrameFresh(ECU_F_SENSORS2) ? g_data.ecu.oilTempC : 0.0f;
+        const uint16_t limit = warmupRpmLimit(oilT);
 
         for (uint8_t k = 0; k < LED_TACH_LEDS; k++)
             {

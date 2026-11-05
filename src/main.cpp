@@ -8,8 +8,9 @@
 // The architecture in one picture:
 //
 //    CAN interrupt -> ring buffer -> canBusPoll() ---+
-//    ADC pins  ------> inputsPoll()  (20 ms tick) ---+--> g_data (raw+derived)
-//    RTC + die temp -/                                      |
+//    ADC pins  ------> inputsPoll()  (20 ms tick) ---+--> g_data (raw+derived:
+//    RTC + die temp -/                                |    mixture window,
+//                                                     |    fuel calc)
 //                                                     alarmsUpdate()
 //                                                           v
 //                                                    g_data.alarms --> audio,
@@ -31,9 +32,9 @@
 //
 //   every pass : drain the CAN queue, pump DFPlayer notifications, pump the
 //                FRAM write queue + serial console (all cheap when idle)
-//   20 ms tick : poll inputs, derived values, alarm state machine, LED tach
-//                frame, screens 1-3 (draw + diff + DMA), backlight PWM,
-//                feed the watchdog
+//   20 ms tick : poll inputs, resolve the dial, mixture window, fuel calc,
+//                alarm state machine, LED tach frame, screens 1-3 (draw +
+//                diff + DMA), backlight PWM, feed the watchdog
 //   1 s tick   : PCS heartbeat, audio arbitration, FRAM fuel record +
 //                black-box log record, debug snapshot
 //
@@ -50,6 +51,7 @@
 #include "can_bus.h"
 #include "inputs.h"
 #include "modes.h"
+#include "mixture.h"
 #include "fuel_calc.h"
 #include "alarms.h"
 #include "audio.h"
@@ -60,57 +62,10 @@
 #include "fram.h"
 #include "fram_log.h"
 
-// --- derived values -----------------------------------------------------------
-// Numbers computed FROM inputs live here, downstream of acquisition: the
-// decoders store exactly what was measured, and everything calculated gets
-// derived in one visible place each tick.
-
-static void computeDerived()
-    {
-    // Injector duty cycle. With sequential injection each injector fires
-    // once per engine cycle (2 crank revs), so the time available per
-    // injection at a given rpm is (2 * 60000 / rpm) ms. duty = pw / available:
-    //   duty% = pw(ms) * rpm / 1200   (at 1 event per cycle)
-    // e.g. 10 ms of pulsewidth at 6000 rpm -> 20 ms window -> 50%.
-    if (g_data.ecu.rpm > 0)
-        {
-        g_data.ecu.injDutyPct = g_data.ecu.pw1Ms * (float)g_data.ecu.rpm
-                                * INJ_EVENTS_PER_ENGINE_CYCLE / 1200.0f;
-        }
-    else
-        {
-        g_data.ecu.injDutyPct = 0.0f;
-        }
-
-    // Two-second lambda-error average - the AFR alarms are defined on this
-    // (plan: "Lamda (two-second average)"), never on a single noisy sample.
-    // lambda error = (AFR - AFR target) / stoich; positive = lean.
-    // Only meaningful when the engine is running and both source groups are
-    // fresh; otherwise it pins to 0, which conveniently deactivates every
-    // AFR alarm condition without them needing their own validity checks.
-    static bool lambdaPrimed = false;
-    const bool lambdaValid = g_data.ecuGroupFresh(1, ECU_FRESH_SLOW_MS)  // afrTarget
-                          && g_data.ecuGroupFresh(3, ECU_FRESH_FAST_MS)  // afr
-                          && g_data.ecu.afrTarget > 5.0f  // 0 until first group-1 frame
-                          && g_data.ecu.rpm > ENGINE_RUNNING_RPM;
-    if (lambdaValid)
-        {
-        const float err   = (g_data.ecu.afr - g_data.ecu.afrTarget) / AFR_STOICH;
-        const float alpha = (TICK_FAST_MS / 1000.0f) / LAMBDA_AVG_TAU_S;
-        if (!lambdaPrimed) { g_data.ecu.lambdaErr2s = err; lambdaPrimed = true; }
-        else               { g_data.ecu.lambdaErr2s += alpha * (err - g_data.ecu.lambdaErr2s); }
-        }
-    else
-        {
-        g_data.ecu.lambdaErr2s = 0.0f;
-        lambdaPrimed = false;
-        }
-    }
-
 // --- 1 Hz debug snapshot ---------------------------------------------------------
 // The whole g_data struct, one section per line. This is the bring-up and
-// debugging tool for the input phase (and a permanent friend: it costs
-// nothing when no USB host is listening).
+// debugging tool (and a permanent friend: it costs nothing when no USB host
+// is listening).
 
 static void debugPrint()
     {
@@ -119,13 +74,29 @@ static void debugPrint()
     const SwitchData& s = g_data.sw;
     const BoardData&  b = g_data.board;
 
-    Serial.printf("[ECU ] %s rpm=%u map=%.1fkPa clt=%.1fC mat=%.1fC batt=%.1fV afr=%.1f(tgt %.1f) ego=%+.1f%%\n",
-                  g_data.ecuOnline() ? "ONLINE " : "OFFLINE",
-                  e.rpm, e.mapKpa, e.cltC, e.matC, e.battVolts, e.afr, e.afrTarget, e.egoCorPct);
-    Serial.printf("       oilP=%.1fpsi oilT=%.1fC pw1=%.2fms duty=%.1f%% adv=%.1fdeg eng=0x%02X frames=%lu unk=%lu\n",
-                  e.oilPressPsi, e.oilTempC, e.pw1Ms, e.injDutyPct, e.sparkAdvDeg,
-                  e.engineBits, (unsigned long)e.frameCount,
-                  (unsigned long)g_data.unknownFrameCount);
+    // ECU link: OK = every decoded frame fresh; PARTIAL names the first
+    // stale one (exactly what NO CAN is complaining about); OFFLINE = not
+    // even the rpm heartbeat. docs/ECU_CAN_SETUP.md maps names to settings.
+    const uint8_t stale = g_data.ecuFirstStaleFrame();
+    if (stale == ECU_F_COUNT)    Serial.printf("[ECU ] OK      ");
+    else if (g_data.ecuOnline()) Serial.printf("[ECU ] PARTIAL (no %s) ", ecuFrameName(stale));
+    else                         Serial.printf("[ECU ] OFFLINE ");
+    Serial.printf("rpm=%u map=%.1fkPa clt=%.0fC iat=%.0fC batt=%.2fV lam=%.3f(tgt %.3f) trim=%+.1f%%\n",
+                  e.rpm, e.mapKpa, e.cltC, e.matC, e.battVolts,
+                  e.lambda, e.lambdaTarget, e.egoCorPct);
+    Serial.printf("       oilP=%.1fpsi oilT=%.0fC tps=%.1f%% pedal=%.1f%% pw=%.2fms duty=%.1f%% adv=%.1fdeg st=0x%02X%s%s warn=%u err=%u\n",
+                  e.oilPressPsi, e.oilTempC, e.tpsPct, e.pedalPct, e.injPwMs,
+                  e.injDutyPct, e.sparkAdvDeg, e.statusBits,
+                  e.revLimited() ? " REVLIM" : "", e.checkEngine() ? " CEL" : "",
+                  e.warningCount, e.lastError);
+    // The mixture window: "judging" once mixture.cpp has a full window of
+    // valid samples, "gated" while it is excluding them (closed throttle,
+    // fuel cut, holdoff, no reading). unk should stay 0; ign climbs by design.
+    Serial.printf("       mix %s err2s=%+.3f%s frames=%lu unk=%lu ign=%lu\n",
+                  e.lambdaJudgeable ? "judging" : "gated", e.lambdaErr2s,
+                  e.lambdaUnderLoad ? " (under load)" : "",
+                  (unsigned long)e.frameCount, (unsigned long)g_data.unknownFrameCount,
+                  (unsigned long)g_data.ignoredFrameCount);
 
     const BmsData& m = g_data.bms;
     static const char* bmsModes[] = { "IDLE", "CHG", "DIS" };
@@ -153,6 +124,11 @@ static void debugPrint()
                       f.calcGallons, f.calcPct, f.burnGph, f.burnedTotalGal);
     else
         Serial.printf("calc awaiting seed (used %.2fgal)", f.burnedTotalGal);
+    // rusEFI's own flow figure next to ours - a free cross-check of the
+    // injector model (0 if the ECU build doesn't compute it). g/s -> gal/h
+    // at ~0.745 kg/L petrol, so expect a percent or two of slack.
+    Serial.printf(" | ecu %.2fg/s (~%.2fgph)", e.fuelFlowGps,
+                  e.fuelFlowGps * 3600.0f / 745.0f / 3.78541f);
     if (f.fillActive)
         Serial.printf(" | FILL held %lus cans=%u full=%d",
                       (unsigned long)(s.rotaryHeldMs() / 1000),
@@ -215,7 +191,7 @@ void setup()
     Serial.begin(115200);
     delay(400); // give a just-plugged-in serial monitor a moment to attach
 
-    Serial.println("\n=== Rally CAN Gauge - inputs + alarms + FRAM build ===");
+    Serial.println("\n=== Rally CAN Gauge ===");
     watchdogPrintResetCause(); // first thing: did we get here via a crash?
     inputsInit();
     canBusInit();
@@ -258,7 +234,7 @@ void loop()
 
         inputsPoll();     // fuel, rotary, switches, temp, clock -> g_data
         modesUpdate();    // dial position -> resolved mode flags (g_data.mode)
-        computeDerived(); // math on this tick's snapshot
+        mixtureUpdate();  // gated two-second lambda window -> g_data.ecu
         fuelCalcUpdate(); // burn integration + FUEL FILL gesture -> g_data.fuel
         alarmsUpdate();   // evaluate the whole warning catalog -> g_data.alarms
         ledTachUpdate();  // paint the strip from this tick's verdicts (50 Hz)

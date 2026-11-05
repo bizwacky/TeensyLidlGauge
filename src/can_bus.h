@@ -2,12 +2,15 @@
 // Rally CAN Gauge - CAN bus input (ECU + BMS decode)
 // ---------------------------------------------------------------------------
 // Hardware: Teensy CAN3 (pins 30 RX / 31 TX) -> SN65HVD230-class transceiver
-// -> the car's 500 kbps bus shared by the rusEFI ECU and the JK BMS.
+// -> the car's 500 kbps bus shared by the rusEFI ECU (Super uaEFI, with its
+// on-board wideband controller) and the JK BMS.
 //
-// Two protocols, one bus:
-//  * ECU: Megasquirt "Advanced Real-Time Data Broadcast" (big-endian, 50 Hz)
-//    - groups/rates/sensor mappings in docs/ECU_CAN_SETUP.md.
-//  * BMS: JK BMS speaking the Deye protocol (little-endian, 1 Hz)
+// Three broadcasts, one bus, all little-endian:
+//  * rusEFI's native broadcast, frames BASE0..BASE7 (layouts from rusEFI's
+//    own DBC) - nearly everything the gauge shows and judges.
+//  * rusEFI's "MS Simplified Broadcast" - only the target AFR byte.
+//    Settings for both + frame tables: docs/ECU_CAN_SETUP.md.
+//  * BMS: JK BMS speaking the Deye protocol (1 Hz)
 //    - frames + JK app settings in docs/BMS_CAN_SETUP.md.
 // Change the config on either device, change the matching doc + config.h.
 // ---------------------------------------------------------------------------

@@ -41,9 +41,9 @@
 // box exists to keep.
 //
 // FIELD ENCODING: 8-bit scaled integers, chosen so range and resolution
-// beat the sensors' own honesty (1 kPa, 0.1 V, 1 C at +40 offset, 0.1 AFR,
-// 10 mV/cell). A float per field would triple the record and halve the
-// history for precision nobody would ever read back.
+// beat the sensors' own honesty (1 kPa, 0.1 V, 1 C at +40 offset, 0.01
+// lambda, 10 mV/cell). A float per field would triple the record and halve
+// the history for precision nobody would ever read back.
 // ---------------------------------------------------------------------------
 
 #include <Arduino.h>
@@ -66,9 +66,11 @@ static const uint32_t FRAM_MAGIC          = ((uint32_t)'G' << 24) | ((uint32_t)'
                                           | ((uint32_t)'3' << 8) | (uint32_t)'E'; // "E30G"
 // v2: DIALFAIL joined the alarm catalog between NO CAN and BATTCOLD, which
 // shifted the bit numbers of every alarm below it in LogRecord.alarmBits.
-// Old chips reformat on first boot rather than decode blue alarms as
-// their neighbors.
-static const uint16_t FRAM_LAYOUT_VERSION = 2;
+// v3: the ECU moved to rusEFI's broadcast - bytes 8-9 now hold rusEFI's last
+// error code (it broadcasts no uptime) and the mixture bytes hold lambda
+// x 100 instead of AFR x 10. Old chips reformat on first boot rather than
+// decode old bytes under new meanings.
+static const uint16_t FRAM_LAYOUT_VERSION = 3;
 
 struct __attribute__((packed)) FramHeader          // 32 B at 0x0000
     {
@@ -108,17 +110,18 @@ struct __attribute__((packed)) LogRecord           // 32 B, the black box entry
     {
     uint32_t seq;          // monotonic forever (never resets except format)
     uint8_t  session;      // which run this belongs to - splits the CSV
-    uint8_t  hh, mm, ss;   // RTC wall clock; 0xFF = clock wasn't set
-    uint16_t ecuSecondsOn; // the ECU's own uptime counter - the key that
-                           // lines this log up with the ECU's SD log
+    uint8_t  hh, mm, ss;   // RTC wall clock (the key that lines this log up
+                           // with the ECU's own log); 0xFF = clock not set
+    uint16_t ecuLastError; // rusEFI's most recent warning/error code - what
+                           // the ECU itself was complaining about
     uint16_t rpm;
     uint8_t  oilPressPsi;  // 1 psi/count
     uint8_t  oilTempC40;   // deg C + 40 (covers -40..+215)
     uint8_t  cltC40;       // deg C + 40
     uint8_t  mapKpa;       // 1 kPa/count
     uint8_t  tpsPct;       // %
-    uint8_t  afr10;        // AFR x 10
-    uint8_t  afrTgt10;     // AFR target x 10
+    uint8_t  lambda100;    // measured lambda x 100 (0 = no reading)
+    uint8_t  lambdaTgt100; // target lambda x 100
     uint8_t  battV10;      // volts x 10 (ECU-measured 12V system)
     uint8_t  injDutyPct;   // %
     uint8_t  fuelSendPct;  // slosh-filtered sender level, %
@@ -130,6 +133,7 @@ struct __attribute__((packed)) LogRecord           // 32 B, the black box entry
     uint16_t crc;
     };
 static_assert(sizeof(LogRecord) == 32, "log record must be exactly 32 bytes");
+static_assert(ALARM_COUNT <= 32, "alarmBits holds one bit per alarm - widen it before adding more");
 
 // Ring capacity: every 32-byte slot that fits between the bookkeeping area
 // and the end of the chip. (131072 - 1024) / 32 = 4064 records.
@@ -177,6 +181,7 @@ static bool writeSync(uint32_t addr, const void* src, uint8_t len)
 static uint8_t encU8(float v)    { return (uint8_t)constrain(v, 0.0f, 255.0f); }
 static uint8_t encTempC(float c) { return encU8(c + 40.0f); }
 static uint8_t encX10(float v)   { return encU8(v * 10.0f); }
+static uint8_t encX100(float v)  { return encU8(v * 100.0f); }
 static int8_t  encAmps(float a)  { return (int8_t)constrain(a, -127.0f, 127.0f); }
 static uint8_t encCell(float v)  { return encU8((v - 1.0f) * 100.0f); }
 
@@ -298,15 +303,15 @@ static void blackBoxTick()
     rec.hh           = g_data.board.clockValid ? g_data.board.hh : 0xFF;
     rec.mm           = g_data.board.clockValid ? g_data.board.mm : 0xFF;
     rec.ss           = g_data.board.clockValid ? g_data.board.ss : 0xFF;
-    rec.ecuSecondsOn = e.secondsOn;
+    rec.ecuLastError = e.lastError;
     rec.rpm          = e.rpm;
     rec.oilPressPsi  = encU8(e.oilPressPsi);
     rec.oilTempC40   = encTempC(e.oilTempC);
     rec.cltC40       = encTempC(e.cltC);
     rec.mapKpa       = encU8(e.mapKpa);
     rec.tpsPct       = encU8(e.tpsPct);
-    rec.afr10        = encX10(e.afr);
-    rec.afrTgt10     = encX10(e.afrTarget);
+    rec.lambda100    = encX100(e.lambda);
+    rec.lambdaTgt100 = encX100(e.lambdaTarget);
     rec.battV10      = encX10(e.battVolts);
     rec.injDutyPct   = encU8(e.injDutyPct);
     rec.fuelSendPct  = encU8(f.levelPct);
@@ -528,8 +533,8 @@ static void dumpPump()
             s_dumpCount = s_dumpStep;
             Serial.printf("log: %lu readable records, oldest first:\n",
                           (unsigned long)s_dumpCount);
-            Serial.println("seq,session,time,ecu_s,rpm,oil_psi,oil_C,clt_C,map_kPa,tps,"
-                           "afr,afr_tgt,batt_V,inj_duty,fuel_sender,fuel_calc,"
+            Serial.println("seq,session,time,ecu_err,rpm,oil_psi,oil_C,clt_C,map_kPa,tps,"
+                           "lambda,lambda_tgt,batt_V,inj_duty,fuel_sender,fuel_calc,"
                            "pack_A,cell_min_V,batt_C,alarm_hex,alarms");
             s_dumpPhase = DUMP_PRINTING;
             s_dumpStep  = 0;
@@ -550,7 +555,8 @@ static void dumpPump()
             dumpStop("ABORTED (read error)");
             return;
             }
-        char clock[10];
+        char clock[12]; // "hh:mm:ss" - sized for the full uint8 range so
+                        // a corrupt-but-CRC-valid byte can't truncate it
         if (r.hh == 0xFF) strcpy(clock, "--:--:--");
         else              snprintf(clock, sizeof(clock), "%02u:%02u:%02u", r.hh, r.mm, r.ss);
 
@@ -567,11 +573,11 @@ static void dumpPump()
             strlcat(names, one, sizeof(names));
             }
 
-        Serial.printf("%lu,%u,%s,%u,%u,%u,%d,%d,%u,%u,%.1f,%.1f,%.1f,%u,%u,%u,%d,%.2f,%d,%08lX,%s\n",
-                      (unsigned long)r.seq, r.session, clock, r.ecuSecondsOn, r.rpm,
+        Serial.printf("%lu,%u,%s,%u,%u,%u,%d,%d,%u,%u,%.2f,%.2f,%.1f,%u,%u,%u,%d,%.2f,%d,%08lX,%s\n",
+                      (unsigned long)r.seq, r.session, clock, r.ecuLastError, r.rpm,
                       r.oilPressPsi, (int)r.oilTempC40 - 40, (int)r.cltC40 - 40,
                       r.mapKpa, r.tpsPct,
-                      r.afr10 / 10.0f, r.afrTgt10 / 10.0f, r.battV10 / 10.0f,
+                      r.lambda100 / 100.0f, r.lambdaTgt100 / 100.0f, r.battV10 / 10.0f,
                       r.injDutyPct, r.fuelSendPct, r.fuelCalcPct,
                       (int)r.packAmps, 1.0f + r.cellMin100 / 100.0f,
                       (int)r.battMaxC40 - 40,
