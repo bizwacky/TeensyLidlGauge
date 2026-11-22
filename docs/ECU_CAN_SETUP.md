@@ -122,6 +122,8 @@ target from them.
 | MS Simplified (5 frames every 10 ms, fixed) | 500 | ~13 % |
 | rusEFI native at 50 ms (12 frames) | 240 | ~6 % |
 | wideband, BMS, gauge heartbeat | a few hundred | a few % |
+| two PDMs (5-11 status frames each, every 100 ms) | 100-220 | ~3-6 % |
+| gauge switch + pot frames (10 Hz, more while a knob turns) | ~20 | under 1 % |
 
 That's comfortably under the ~50 % where CAN gets crowded. The MS broadcast
 is the expensive part, and it exists here for one byte. If bus load ever

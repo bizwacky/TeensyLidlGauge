@@ -5,10 +5,13 @@
 //   * fuel sender (ratiometric resistance measurement)
 //   * 12-position rotary mode switch (resistor-ladder divider, with
 //     open-circuit detection for the DIALFAIL alarm)
-//   * 12V switch inputs: headlights, brights, left/right blinkers
+//   * the roof switch panel: six ground-switched switches (debounced) and
+//     five pots (percent of travel, with open-wire detection)
 //   * Teensy die temperature
 //   * battery-backed real-time clock
-// Results land in g_data (see vehicle_data.h).
+// Results land in g_data (see vehicle_data.h). What the switches and pots
+// DO is not decided here: can_bus.cpp broadcasts them to the PDMs and
+// fans.cpp turns three of the pots into fan PWM.
 // ---------------------------------------------------------------------------
 
 #pragma once
@@ -17,7 +20,7 @@
 void inputsInit();
 
 // Read every local input into g_data. Called on the 20 ms tick; total cost is
-// well under 1 ms (six averaged ADC reads plus arithmetic).
+// well under 1 ms (seven averaged ADC reads plus arithmetic).
 void inputsPoll();
 
 // Flush the fuel slosh filter so it re-converges quickly. Called by

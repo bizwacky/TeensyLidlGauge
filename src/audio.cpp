@@ -160,6 +160,14 @@ static const char* k_clipNames[CLIP_COUNT] =
     "ECU LINK LOST",
     "BATTERY LINK LOST",
     "MODE DIAL FAULT",
+    "ENGINE POWER FAULT",
+    "FUEL PUMP TRIPPING",
+    "FAN FAULT",
+    "PDM TEMPERATURE",
+    "PDM FAULT",
+    "PDM LINK LOST",
+    "LIGHT FAULT",
+    "CHECK MESSAGES",
     };
 
 // --- the driver ----------------------------------------------------------------

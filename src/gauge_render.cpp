@@ -356,7 +356,9 @@ static void drawBanner(tgx::Image<tgx::RGB565>& im, const Theme& t)
         }
 
     // Catalog names are space-padded to 8 chars ("OIL LOW "); trim the tail
-    // so the centered text is actually centered.
+    // so the centered text is actually centered. (For the PDM rows
+    // alarmName() returns text composed this tick - "PUMP FLT" - which is
+    // why it is copied here rather than held.)
     char name[9];
     strncpy(name, alarmName(top), 8);
     name[8] = '\0';
@@ -467,13 +469,16 @@ static void renderPsiLambda(tgx::Image<tgx::RGB565>& im, const Theme& t)
 
     im.drawFastHLine({262, 98}, SCREEN_LX - 270, t.divider);
 
-    // Indicator row. Blinker inputs carry the flasher relay's actual on/off
-    // wave, so drawing the raw state IS the blink - no timer needed here.
-    const SwitchData& s = g_data.sw;
-    drawLeftTurnIcon  (im, 282, 120, s.blinkerL,   t);
-    drawHeadlightsIcon(im, 322, 120, s.headlights, t);
-    drawBrightsIcon   (im, 362, 120, s.brights,    t);
-    drawRightTurnIcon (im, 402, 120, s.blinkerR,   t);
+    // Indicator row, from what the PDMs report they are driving (pdm.cpp
+    // resolves g_data.lamps from the output states). A turn output carries
+    // the PDM flasher's on/off wave, so drawing the raw state IS the blink -
+    // no timer needed here. A lamp whose PDM is silent draws as off: the
+    // PDME CAN / PDML CAN banner explains why.
+    const LampData& l = g_data.lamps;
+    drawLeftTurnIcon  (im, 282, 120, l.turnL,      t);
+    drawHeadlightsIcon(im, 322, 120, l.headlights, t);
+    drawBrightsIcon   (im, 362, 120, l.brights,    t);
+    drawRightTurnIcon (im, 402, 120, l.turnR,      t);
     }
 
 // --- 6. the MODE_DEBUG dense layout -------------------------------------------------

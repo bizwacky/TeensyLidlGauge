@@ -20,12 +20,12 @@
 //   0x00020  fuel ring    16 x 32 B  slot = seq % 16
 //   0x00220  log head ptr  2 x 16 B  slot = seq % 2 - "where does the log
 //                                    resume?", updated after every record
-//   0x00400  black box    4064 x 32 B circular, to the end of the chip
+//   0x00400  black box    3251 x 40 B circular, to the end of the chip
 //
 // WHY A HEAD POINTER RECORD AT ALL: the ring's write position must survive
 // reboots or every boot would restart at index 0 and chew up the oldest
-// data. The alternatives were (a) scan all 4064 record headers at boot
-// (~1.3 s of I2C) or (b) binary-search the sequence discontinuity (clever,
+// data. The alternatives were (a) scan every record header at boot
+// (over a second of I2C) or (b) binary-search the sequence discontinuity (clever,
 // fragile around corrupt records). Spending 16 bytes per second on a
 // pointer record makes recovery two reads and dead simple. F-RAM endurance
 // makes the "same two slots, once a second, forever" pattern free.
@@ -35,7 +35,7 @@
 // link alarms excluded: a gauge powered with the car off would otherwise
 // log "NO CAN" in a loop until the ring's real content was gone). Cadence
 // is every LOG_NOMINAL_EVERY_S normally, every LOG_ALARM_EVERY_S while an
-// alarm is up - the boring laps stretch the ring to ~2.2 h, the spicy parts
+// alarm is up - the boring laps stretch the ring to ~1.8 h, the spicy parts
 // get full resolution. After the trigger clears, logging runs LOG_GRACE_MS
 // longer: the 30 s AFTER a stall or alarm is exactly the evidence a black
 // box exists to keep.
@@ -54,6 +54,7 @@
 #include "config.h"
 #include "vehicle_data.h"
 #include "alarms.h"    // alarmColor()/alarmName() for gating + CSV decode
+#include "pdm.h"       // pdmDeviceFresh()/pdmVerdictName() for the PDM columns
 #include "fuel_calc.h" // fuelCalcGetState() - the accumulators to persist
 
 // --- record formats ---------------------------------------------------------------
@@ -70,7 +71,13 @@ static const uint32_t FRAM_MAGIC          = ((uint32_t)'G' << 24) | ((uint32_t)'
 // error code (it broadcasts no uptime) and the mixture bytes hold lambda
 // x 100 instead of AFR x 10. Old chips reformat on first boot rather than
 // decode old bytes under new meanings.
-static const uint16_t FRAM_LAYOUT_VERSION = 3;
+// v4 (Nov 2026): the alarm catalogue grew from 26 rows to 36 and was
+// re-ordered, which a 32-bit mask cannot hold. The record grew from 32 to
+// 40 bytes: a 40-bit alarm mask, both PDMs' board temperature and total
+// current, the last PDM output event (which load, what happened, how many
+// amps) and the roof switch states. Ring capacity fell from 4064 records
+// to 3251.
+static const uint16_t FRAM_LAYOUT_VERSION = 4;
 
 struct __attribute__((packed)) FramHeader          // 32 B at 0x0000
     {
@@ -106,7 +113,9 @@ struct __attribute__((packed)) LogPtrRecord        // 16 B x 2 slots at 0x0220
     };
 static_assert(sizeof(LogPtrRecord) == 16, "log pointer must be exactly 16 bytes");
 
-struct __attribute__((packed)) LogRecord           // 32 B, the black box entry
+static const uint8_t LOG_ALARM_BYTES = 5; // 40 bits of alarm mask
+
+struct __attribute__((packed)) LogRecord           // 40 B, the black box entry
     {
     uint32_t seq;          // monotonic forever (never resets except format)
     uint8_t  session;      // which run this belongs to - splits the CSV
@@ -129,14 +138,26 @@ struct __attribute__((packed)) LogRecord           // 32 B, the black box entry
     int8_t   packAmps;     // BMS pack current, 1 A, + = discharge, clamped
     uint8_t  cellMin100;   // (min cell V - 1.0) x 100 -> 1.00..3.55 V
     uint8_t  battMaxC40;   // hottest BMS cell, deg C + 40
-    uint32_t alarmBits;    // bit n = AlarmId n active this second
+    uint8_t  pdmTempC40[PDM_COUNT]; // PDM-E, PDM-L board temp, deg C + 40;
+                                    // 0 = that box was not reporting
+    uint8_t  pdmAmps[PDM_COUNT];    // PDM-E, PDM-L total current, 1 A/count
+    uint8_t  pdmEvent;     // the last PDM output event since the previous
+                           // record, 0 = none. bit 6 = box (0 PDM-E, 1 PDM-L),
+                           // bits 5-2 = output (0 = output 1), bits 1-0 =
+                           // verdict (1 TRP, 2 OPN, 3 FLT)
+    uint8_t  pdmEventAmps; // amps for that event (pdm.cpp says which amps)
+    uint8_t  roofBits;     // roof switches, bit 0 = SW1 on ... bit 5 = SW6 on
+    uint8_t  alarmBits[LOG_ALARM_BYTES]; // bit n = AlarmId n active this
+                                         // second (byte n/8, bit n%8)
     uint16_t crc;
     };
-static_assert(sizeof(LogRecord) == 32, "log record must be exactly 32 bytes");
-static_assert(ALARM_COUNT <= 32, "alarmBits holds one bit per alarm - widen it before adding more");
+static_assert(sizeof(LogRecord) == 40, "log record must be exactly 40 bytes");
+static_assert(sizeof(LogRecord) <= FRAM_MAX_WRITE, "the FRAM write queue must hold a whole log record");
+static_assert(ALARM_COUNT <= LOG_ALARM_BYTES * 8, "alarmBits holds one bit per alarm - widen it before adding more");
+static_assert(PDM_COUNT == 2 && PDM_MAX_OUTPUTS <= 16, "pdmEvent packs the box into 1 bit and the output into 4");
 
-// Ring capacity: every 32-byte slot that fits between the bookkeeping area
-// and the end of the chip. (131072 - 1024) / 32 = 4064 records.
+// Ring capacity: every 40-byte slot that fits between the bookkeeping area
+// and the end of the chip. (131072 - 1024) / 40 = 3251 records.
 static const uint32_t LOG_CAPACITY = (FRAM_SIZE_BYTES - FRAM_ADDR_LOG) / sizeof(LogRecord);
 
 // --- module state -----------------------------------------------------------------
@@ -187,15 +208,16 @@ static uint8_t encCell(float v)  { return encU8((v - 1.0f) * 100.0f); }
 
 // --- black-box gating -------------------------------------------------------------
 
-// "Spicy": any yellow/red alarm EXCEPT the CAN-link pair. NO CAN / BATT CAN
-// mean the data sources are gone - there is nothing worth recording, and a
-// gauge left powered with everything else off would log them forever.
+// "Spicy": any yellow/red alarm EXCEPT the CAN-link rows. NO CAN / BATT CAN
+// / PDMx CAN mean the data sources are gone - there is nothing worth
+// recording, and a gauge left powered with everything else off would log
+// them forever.
 static bool spicyAlarmActive()
     {
     for (uint8_t i = 0; i < ALARM_COUNT; i++)
         {
         if (!g_data.alarms.active[i]) continue;
-        if (i == ALARM_NO_CAN || i == ALARM_BATT_CAN) continue;
+        if (i == ALARM_NO_CAN || i == ALARM_BATT_CAN || i == ALARM_PDM_CAN) continue;
         if (alarmColor(i) >= ALARM_YELLOW) return true;
         }
     return false;
@@ -319,14 +341,33 @@ static void blackBoxTick()
     rec.packAmps     = encAmps(m.packAmps);
     rec.cellMin100   = encCell(m.minCellVolts);
     rec.battMaxC40   = encTempC(m.maxCellTempC);
+    for (uint8_t box = 0; box < PDM_COUNT; box++)
+        {
+        // 0 in the temperature byte doubles as "box silent", so a live box
+        // never encodes below 1 (a real -40 C board is not a case this car
+        // will meet).
+        if (!pdmDeviceFresh(box)) continue; // rec is zeroed: both bytes stay 0
+        const uint8_t t = encTempC(g_data.pdm[box].boardTempC);
+        rec.pdmTempC40[box] = t ? t : 1;
+        rec.pdmAmps[box]    = encU8(g_data.pdm[box].totalAmps);
+        }
+    PdmEventData& ev = g_data.pdmEvent;
+    if (ev.pending)
+        {
+        rec.pdmEvent     = (uint8_t)(((ev.pdm & 0x01) << 6) | ((ev.output & 0x0F) << 2)
+                                     | (ev.verdict & 0x03));
+        rec.pdmEventAmps = encU8(ev.amps);
+        }
+    rec.roofBits = g_data.sw.roofBits;
     for (uint8_t i = 0; i < ALARM_COUNT; i++)
         if (g_data.alarms.active[i])
-            rec.alarmBits |= (1UL << i);
+            rec.alarmBits[i / 8] |= (uint8_t)(1u << (i % 8));
     rec.crc = framCrc16(&rec, sizeof(rec) - 2);
 
     if (!framWriteAsync(logSlotAddr(s_logIdx), &rec, sizeof(rec)))
         return; // queue full (shouldn't happen) - retry next tick
 
+    ev.pending = false; // the event went into the queue with this record
     s_logSeq++;
     s_logIdx = (s_logIdx + 1) % LOG_CAPACITY;
     s_ticksSinceRec = 0;
@@ -535,7 +576,8 @@ static void dumpPump()
                           (unsigned long)s_dumpCount);
             Serial.println("seq,session,time,ecu_err,rpm,oil_psi,oil_C,clt_C,map_kPa,tps,"
                            "lambda,lambda_tgt,batt_V,inj_duty,fuel_sender,fuel_calc,"
-                           "pack_A,cell_min_V,batt_C,alarm_hex,alarms");
+                           "pack_A,cell_min_V,batt_C,pdme_C,pdml_C,pdme_A,pdml_A,"
+                           "pdm_event,event_A,roof_sw,alarm_hex,alarms");
             s_dumpPhase = DUMP_PRINTING;
             s_dumpStep  = 0;
             if (s_dumpCount == 0) dumpStop("done (no contiguous history)");
@@ -560,11 +602,14 @@ static void dumpPump()
         if (r.hh == 0xFF) strcpy(clock, "--:--:--");
         else              snprintf(clock, sizeof(clock), "%02u:%02u:%02u", r.hh, r.mm, r.ss);
 
-        // Decode the alarm bitmask into names: "OIL LOW+FUEL LOW".
-        char names[256] = "";
+        // Decode the alarm bitmask into names: "OIL LOW+FUEL LOW". The PDM
+        // rows' text is composed at run time, so a dump can only print what
+        // those rows say NOW (or their placeholder, "(ENGINE)") - the
+        // pdm_event column is the record of which load it actually was.
+        char names[ALARM_COUNT * 9 + 4] = "";
         for (uint8_t i = 0; i < ALARM_COUNT; i++)
             {
-            if (!(r.alarmBits & (1UL << i))) continue;
+            if (!(r.alarmBits[i / 8] & (1u << (i % 8)))) continue;
             char one[10];
             strncpy(one, alarmName(i), 9);
             one[9] = 0;
@@ -573,7 +618,29 @@ static void dumpPump()
             strlcat(names, one, sizeof(names));
             }
 
-        Serial.printf("%lu,%u,%s,%u,%u,%u,%d,%d,%u,%u,%.2f,%.2f,%.1f,%u,%u,%u,%d,%.2f,%d,%08lX,%s\n",
+        // PDM columns: a silent box prints empty temperature/current cells;
+        // the event prints as "PDME:PUMP:TRP" or stays empty.
+        char pdmT[PDM_COUNT][6], pdmA[PDM_COUNT][6];
+        for (uint8_t box = 0; box < PDM_COUNT; box++)
+            {
+            pdmT[box][0] = pdmA[box][0] = 0;
+            if (r.pdmTempC40[box] == 0) continue;
+            snprintf(pdmT[box], sizeof(pdmT[box]), "%d", (int)r.pdmTempC40[box] - 40);
+            snprintf(pdmA[box], sizeof(pdmA[box]), "%u", r.pdmAmps[box]);
+            }
+        char event[16] = "", eventA[6] = "";
+        if (r.pdmEvent & 0x03)
+            {
+            const uint8_t box = (r.pdmEvent >> 6) & 0x01;
+            const uint8_t out = (r.pdmEvent >> 2) & 0x0F;
+            snprintf(event, sizeof(event), "%s:%.4s:%s", pdmName(box),
+                     (out < PDM_MAX_OUTPUTS) ? PDM_OUTPUTS[box][out].tag : "????",
+                     pdmVerdictName(r.pdmEvent & 0x03));
+            snprintf(eventA, sizeof(eventA), "%u", r.pdmEventAmps);
+            }
+
+        Serial.printf("%lu,%u,%s,%u,%u,%u,%d,%d,%u,%u,%.2f,%.2f,%.1f,%u,%u,%u,%d,%.2f,%d,"
+                      "%s,%s,%s,%s,%s,%s,%02X,%02X%02X%02X%02X%02X,%s\n",
                       (unsigned long)r.seq, r.session, clock, r.ecuLastError, r.rpm,
                       r.oilPressPsi, (int)r.oilTempC40 - 40, (int)r.cltC40 - 40,
                       r.mapKpa, r.tpsPct,
@@ -581,7 +648,10 @@ static void dumpPump()
                       r.injDutyPct, r.fuelSendPct, r.fuelCalcPct,
                       (int)r.packAmps, 1.0f + r.cellMin100 / 100.0f,
                       (int)r.battMaxC40 - 40,
-                      (unsigned long)r.alarmBits, names);
+                      pdmT[PDM_E], pdmT[PDM_L], pdmA[PDM_E], pdmA[PDM_L],
+                      event, eventA, r.roofBits,
+                      r.alarmBits[4], r.alarmBits[3], r.alarmBits[2],
+                      r.alarmBits[1], r.alarmBits[0], names);
         s_dumpStep++;
         }
     }

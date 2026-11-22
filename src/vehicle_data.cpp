@@ -71,3 +71,43 @@ bool VehicleData::bmsOnline() const
     {
     return bmsFrameFresh(BMS_F_PACK, BMS_OFFLINE_MS);
     }
+
+// --- the PDMs ---------------------------------------------------------------------
+// Staleness is judged per row of PDM_FRAMES (config.h), the same idea as the
+// ECU and BMS frames above.
+
+bool VehicleData::pdmFrameSeen(uint8_t box, uint8_t row) const
+    {
+    if (box >= PDM_COUNT || row >= PDM_FRAME_COUNT) return false;
+    return pdm[box].frameLastRxMs[row] != 0;
+    }
+
+bool VehicleData::pdmFrameFresh(uint8_t box, uint8_t row) const
+    {
+    if (!pdmFrameSeen(box, row)) return false;
+    return (millis() - pdm[box].frameLastRxMs[row]) <= PDM_FRESH_MS;
+    }
+
+// "Is this box telling us everything it owes us?" A frame the firmware
+// always sends must be fresh. A frame that only some firmware sends (the
+// fork's rows for outputs 9-14) is owed from the moment it first arrives:
+// a stock 8-output board on the bench never sends it and is still online,
+// while a fork box that STOPS sending it is not.
+bool VehicleData::pdmOnline(uint8_t box) const
+    {
+    if (box >= PDM_COUNT) return false;
+    for (uint8_t row = 0; row < PDM_FRAME_COUNT; row++)
+        {
+        const PdmFrameNeed need = PDM_FRAMES[row].need;
+        if (need == PDM_NEED_NEVER) continue;
+        if (need == PDM_NEED_ONCE_SEEN && !pdmFrameSeen(box, row)) continue;
+        if (!pdmFrameFresh(box, row)) return false;
+        }
+    return true;
+    }
+
+const char* pdmName(uint8_t box)
+    {
+    static const char* const names[PDM_COUNT] = { "PDME", "PDML" };
+    return (box < PDM_COUNT) ? names[box] : "PDM?";
+    }

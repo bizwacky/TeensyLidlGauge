@@ -16,8 +16,17 @@
 // Decoding: the ECU half follows rusEFI's own definitions - its DBC
 // (firmware/controllers/can/rusEFI_CAN_verbose.dbc) for the native frames,
 // can_dash_ms.cpp for the one MS Simplified byte we take. The BMS half
-// follows the Deye protocol PDF. docs/ECU_CAN_SETUP.md and
-// docs/BMS_CAN_SETUP.md carry the frame tables.
+// follows the Deye protocol PDF. The PDM half follows dingoFW's
+// boards/dingopdm_v7/msg.cpp through the PDM_FRAMES table in config.h.
+// docs/ECU_CAN_SETUP.md, docs/BMS_CAN_SETUP.md and docs/PDM_CAN_SETUP.md
+// carry the frame tables.
+//
+// TRANSMITTING. The gauge also talks: the 1 Hz PCS heartbeat for the BMS
+// (canBusTick1s) and, since the roof switch panel moved onto the gauge, the
+// two frames that carry its switches and pots to the PDMs (canBusTick20ms).
+// Those two are the car's light switches - their layout is at the bottom of
+// this file and in docs/PDM_CAN_SETUP.md, and it is a contract with each
+// PDM's dingoConfig setup: change one side, change the other.
 // ---------------------------------------------------------------------------
 
 #include "can_bus.h"
@@ -234,11 +243,96 @@ static bool decodeBmsFrame(uint32_t id, const uint8_t* d, uint8_t len)
     return true;
     }
 
+// --- the PDM status frames ---------------------------------------------------------
+// dingoFW sends every status frame every 100 ms, 8 bytes, little-endian.
+// WHICH frame carries WHAT is not written here: it is the PDM_FRAMES table
+// in config.h (one row per frame: id offset, kind, which outputs). This
+// function only knows how each KIND packs its fields, so a firmware that
+// moves or adds frames - the 14-output fork - needs a table edit, not code.
+
+// Which g_data.pdm[] slot owns this id, or -1 if it is not a PDM's. Also
+// hands back the id's offset from that box's Base ID.
+//
+// THIS IS THE ONE PLACE that ties a box to a role. Today the Base ID burned
+// into a box IS its role. If "the role follows the plug" is adopted, decode
+// by Base ID into a per-BOX slot and derive the role from the strap inputs
+// (PdmData::digInBits) here.
+static int8_t pdmSlotForId(uint32_t id, uint8_t& offset)
+    {
+    for (uint8_t box = 0; box < PDM_COUNT; box++)
+        {
+        if (id >= PDM_BASE_ID[box] && id < PDM_BASE_ID[box] + PDM_ID_BLOCK)
+            {
+            offset = (uint8_t)(id - PDM_BASE_ID[box]);
+            return (int8_t)box;
+            }
+        }
+    return -1;
+    }
+
+// Returns false when no row of PDM_FRAMES claims this offset (the box's
+// settings channel and the status frames the gauge has no use for).
+static bool decodePdmFrame(uint8_t box, uint8_t offset, const uint8_t* d, uint8_t len)
+    {
+    if (len < 8) return false; // every dingoFW status frame carries 8 bytes
+
+    PdmData& p = g_data.pdm[box];
+
+    for (uint8_t row = 0; row < PDM_FRAME_COUNT; row++)
+        {
+        const PdmFrameDef& def = PDM_FRAMES[row];
+        if (def.idOffset != offset) continue;
+
+        switch (def.kind)
+            {
+            case PDM_KIND_DEVICE:
+                p.digInBits   = d[0];
+                p.deviceState = d[1] & 0x0F;
+                p.boardType   = d[1] >> 4;
+                p.totalAmps   = le16u(d + 2) * PDM_AMPS_PER_COUNT;
+                p.battVolts   = le16u(d + 4) * 0.1f;
+                p.boardTempC  = le16s(d + 6) * 0.1f;
+                break;
+
+            case PDM_KIND_CURRENT: // one uint16 per output, four fit a frame
+                for (uint8_t k = 0; k < def.outputs && k < 4; k++)
+                    if (def.firstOutput + k < PDM_MAX_OUTPUTS)
+                        p.out[def.firstOutput + k].amps = le16u(d + 2 * k) * PDM_AMPS_PER_COUNT;
+                break;
+
+            case PDM_KIND_STATE: // one nibble per output, low nibble first
+                for (uint8_t k = 0; k < def.outputs && k < 16; k++)
+                    if (def.firstOutput + k < PDM_MAX_OUTPUTS)
+                        p.out[def.firstOutput + k].state =
+                            (k & 1) ? (uint8_t)(d[k / 2] >> 4) : (uint8_t)(d[k / 2] & 0x0F);
+                break;
+
+            case PDM_KIND_OC_COUNT: // one byte per output
+                for (uint8_t k = 0; k < def.outputs && k < 8; k++)
+                    if (def.firstOutput + k < PDM_MAX_OUTPUTS)
+                        p.out[def.firstOutput + k].ocCount = d[k];
+                break;
+
+            case PDM_KIND_DUTY: // one byte per output, percent
+                for (uint8_t k = 0; k < def.outputs && k < 8; k++)
+                    if (def.firstOutput + k < PDM_MAX_OUTPUTS)
+                        p.out[def.firstOutput + k].dutyPct = d[k];
+                break;
+            }
+
+        p.frameLastRxMs[row] = millis(); // after decoding, like the ECU frames
+        p.frameCount++;
+        return true;
+        }
+    return false;
+    }
+
 // --- expected traffic we deliberately don't decode -------------------------------
 // Counting these as "unknown" would bury real surprises, so they get their
 // own counter. The JK BMS's other Deye frames (docs/BMS_CAN_SETUP.md) and
 // the rusEFI wideband controller's frames are listed here; the unused
-// rusEFI/MS frames are recognised by id range in onCanFrame().
+// rusEFI/MS frames and the rest of each PDM's id block are recognised by
+// id range in onCanFrame().
 
 static const uint16_t k_bmsUnusedIds[] =
     {
@@ -290,6 +384,17 @@ static void onCanFrame(const CAN_message_t& msg)
         return;
         }
 
+    uint8_t      pdmOffset = 0;
+    const int8_t pdmBox    = pdmSlotForId(id, pdmOffset);
+    if (pdmBox >= 0)
+        {
+        // Anything else in a PDM's block is its own business: the dingoConfig
+        // settings channel (Base+0/+1) and status frames we take nothing from.
+        if (!decodePdmFrame((uint8_t)pdmBox, pdmOffset, msg.buf, msg.len))
+            g_data.ignoredFrameCount++;
+        return;
+        }
+
     if (decodeBmsFrame(id, msg.buf, msg.len))
         return; // timestamping is handled inside (it knows the frame slot)
 
@@ -318,11 +423,122 @@ void canBusInit()
                   (unsigned long)(RUSEFI_CAN_BASE_ID + RUSEFI_CAN_FRAME_COUNT - 1),
                   (unsigned long)MS_DASH_AFR_TARGET_ID,
                   (unsigned long)BMS_ID_SOC, (unsigned long)BMS_ID_PACK);
+    Serial.printf("      PDM-E base 0x%03lX, PDM-L base 0x%03lX; gauge sends 0x%03lX + 0x%03lX every %lu ms\n",
+                  (unsigned long)PDM_BASE_ID[PDM_E], (unsigned long)PDM_BASE_ID[PDM_L],
+                  (unsigned long)GAUGE_ID_SWITCHES, (unsigned long)GAUGE_ID_POTS,
+                  (unsigned long)GAUGE_TX_PERIOD_MS);
     }
 
 void canBusPoll()
     {
     s_can.events(); // drain the ring buffer -> onCanFrame() per frame
+    }
+
+// --- the gauge's own frames: roof switches + pots -> the PDMs -----------------------
+// Two 8-byte frames, sent every GAUGE_TX_PERIOD_MS and immediately (this
+// tick) whenever their content changes, so a switch reaches the PDMs within
+// one debounce + 20 ms and a silent switch still refreshes the PDMs' timeouts.
+//
+// GAUGE_ID_SWITCHES
+//   byte 0  switch ON bits    bit 0 = SW1 ... bit 5 = SW6   (1 = switch is on)
+//   byte 1  switch OFF bits   bit 0 = SW1 ... bit 5 = SW6   (1 = switch is off)
+//   byte 2  pot ACTIVE bits   bit 0 = pot 1 ... bit 4 = pot 5 (1 = turned up)
+//   byte 3  pot FAULT bits    bit 0 = pot 1 ... bit 4 = pot 5 (1 = wire open,
+//                             the pot's value is its failsafe)
+//   byte 4  gauge state       bits 0-3 dial position, bit 4 night, bit 5
+//                             silent, bit 6 displays off, bit 7 dial fault
+//   byte 5  alarm summary     bit 0 = a red alarm is up, bit 1 = a yellow is
+//   byte 6  top alarm         AlarmId of the banner alarm, 0xFF = nominal
+//   byte 7  alive counter     +1 per transmission, wraps
+//
+// GAUGE_ID_POTS
+//   bytes 0-4  pot 1..5 position, 0..100 %  (a PDM can use it directly as a
+//              PWM duty: dingoFW "variable duty cycle", denominator 1)
+//   bytes 5-7  fan PWM 1..3 duty the gauge is driving, 0..100 %
+//
+// WHY EVERY SWITCH IS SENT TWICE: dingoFW zeroes a timed-out CAN input, so
+// "0" is what a PDM sees when the gauge is dead. Bytes 0 and 1 are always
+// complements, which lets the PDM config choose the failure direction per
+// load: drive it from the ON bit and it fails OFF; drive it from
+// NOT(OFF bit) and it fails ON. The lamps use the second form - a dead gauge
+// or a cut bus must not put the lights out on a night stage.
+
+static void buildSwitchFrame(uint8_t* b)
+    {
+    const SwitchData& sw = g_data.sw;
+    const ModeData&   m  = g_data.mode;
+    const AlarmsData& a  = g_data.alarms;
+
+    const uint8_t allSwitches = (uint8_t)((1u << ROOF_SWITCH_COUNT) - 1);
+
+    uint8_t potActive = 0, potFault = 0;
+    for (uint8_t i = 0; i < POT_COUNT; i++)
+        {
+        if (sw.pot[i].active) potActive |= (uint8_t)(1u << i);
+        if (sw.pot[i].open)   potFault  |= (uint8_t)(1u << i);
+        }
+
+    b[0] = sw.roofBits & allSwitches;
+    b[1] = (uint8_t)(~sw.roofBits) & allSwitches;
+    b[2] = potActive;
+    b[3] = potFault;
+    b[4] = (uint8_t)((sw.rotaryPos & 0x0F)
+                     | (m.night       ? 0x10 : 0)
+                     | (m.silent      ? 0x20 : 0)
+                     | (m.displaysOff ? 0x40 : 0)
+                     | (sw.rotaryOpen ? 0x80 : 0));
+    b[5] = (uint8_t)((a.anyRed ? 0x01 : 0) | (a.anyYellow ? 0x02 : 0));
+    b[6] = a.top;
+    b[7] = 0; // the alive counter is added at send time - it must not count
+              // as a "change", or the frame would go out on every tick
+    }
+
+static void buildPotFrame(uint8_t* b)
+    {
+    for (uint8_t i = 0; i < 8; i++) b[i] = 0;
+    for (uint8_t i = 0; i < POT_COUNT && i < 5; i++)
+        b[i] = (uint8_t)constrain(g_data.sw.pot[i].pct + 0.5f, 0.0f, 100.0f);
+    for (uint8_t i = 0; i < FAN_COUNT && i < 3; i++)
+        b[5 + i] = g_data.fans.dutyPct[i];
+    }
+
+void canBusTick20ms()
+    {
+    static uint8_t  s_lastSwitch[8], s_lastPot[8];
+    static uint32_t s_lastSwitchMs, s_lastPotMs;
+    static bool     s_sentOnce;
+    static uint8_t  s_alive;
+
+    const uint32_t now = millis();
+    CAN_message_t  msg;
+    msg.len = 8;
+
+    uint8_t b[8];
+
+    buildSwitchFrame(b);
+    if (!s_sentOnce || memcmp(b, s_lastSwitch, 8) != 0
+        || now - s_lastSwitchMs >= GAUGE_TX_PERIOD_MS)
+        {
+        memcpy(s_lastSwitch, b, 8);
+        s_lastSwitchMs = now;
+        msg.id = GAUGE_ID_SWITCHES;
+        memcpy(msg.buf, b, 8);
+        msg.buf[7] = s_alive++;
+        s_can.write(msg);
+        }
+
+    buildPotFrame(b);
+    if (!s_sentOnce || memcmp(b, s_lastPot, 8) != 0
+        || now - s_lastPotMs >= GAUGE_TX_PERIOD_MS)
+        {
+        memcpy(s_lastPot, b, 8);
+        s_lastPotMs = now;
+        msg.id = GAUGE_ID_POTS;
+        memcpy(msg.buf, b, 8);
+        s_can.write(msg);
+        }
+
+    s_sentOnce = true;
     }
 
 void canBusTick1s()

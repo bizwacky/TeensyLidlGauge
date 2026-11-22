@@ -40,6 +40,16 @@ enum AudioClip : uint8_t
     CLIP_NO_CAN,       // "E C U link lost"
     CLIP_BATT_CAN,     // "battery link lost"
     CLIP_DIAL_FAIL,    // "mode dial fault" (rotary switch reads open)
+    // --- added Nov 2026 with the PDM alarms: tracks 0016..0023. Appended, so
+    //     every earlier clip keeps its track number and its file. ---
+    CLIP_ENGINE_POWER, // "engine power fault" (pump / coil / main feed dead or dying)
+    CLIP_PUMP_TRIP,    // "fuel pump tripping"
+    CLIP_FAN_FAULT,    // "fan fault"
+    CLIP_PDM_TEMP,     // "P D M temperature"
+    CLIP_PDM_FAULT,    // "P D M fault"
+    CLIP_PDM_LINK,     // "P D M link lost"
+    CLIP_LIGHT_FAULT,  // "light fault" (also wipers and defrost: the vision class)
+    CLIP_CHECK_MSG,    // "check messages" (something that can wait for service)
     CLIP_COUNT
     };
 

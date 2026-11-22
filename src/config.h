@@ -5,8 +5,34 @@
 // file. If the wiring or the ECU configuration changes, this should be the
 // only file that needs editing (the .cpp files just consume these names).
 //
-// Pin assignments follow the "Teensy Pinout" table in
-// ../../Rally CAN Gauge Project Plan.md - update both together.
+// THE BOARD: a SparkFun MicroMod Teensy in an M.2 socket (it replaced the
+// Teensy 4.0 in Nov 2026). Pin numbers below are Teensyduino pin numbers,
+// which is also how the schematic names the MicroMod symbol's pins
+// ("7_Switch_1", "33_PWM_3"...). The whole map, as wired on the PCB:
+//
+//    0  SPI1 DC (disp 2)     16  pot 3 (A2)            32  roof switch 2
+//    1  SPI1 TE (reserved)   17  pot 4 (A3)            33  fan PWM 3
+//    2  backlight 1 PWM      18  FRAM SDA              34  SPI2 TE (reserved)
+//    3  backlight 2 PWM      19  FRAM SCL              35  SPI2 MOSI (disp 3)
+//    4  fan PWM 1            20  SPI1 RESET            36  SPI2 DC
+//    5  fan PWM 2            21  SPI1 CS               37  SPI2 SCK
+//    6  SPI0 RESET (disp 1)  22  backlight 3 PWM       38  SPI2 RESET
+//    7  roof switch 1        23  fuel sender (A9)      39  SPI2 CS
+//    8  LED strip data       24  rotary dial (A10)     40  IMU SCL
+//    9  SPI0 CS              25  pot 5 (A11)           41  IMU SDA
+//   10  SPI0 DC              26  SPI1 MOSI             42  roof switch 3
+//   11  SPI0 MOSI            27  SPI1 SCK              43  roof switch 4
+//   12  SPI0 TE (reserved)   28  MP3 RX (Serial7)      44  roof switch 5
+//   13  SPI0 SCK             29  MP3 TX (Serial7)      45  roof switch 6
+//   14  pot 1 (A0)           30  CAN3 RX
+//   15  pot 2 (A1)           31  CAN3 TX
+//
+// Checked Nov 2026 against the KiCad netlist and the Teensy core's MicroMod
+// tables: pins 0-37 sit on the same RT1062 pads as on the Teensy 4.0, so
+// every peripheral the 4.0 design used (LPSPI4/3/1, FlexPWM4 for the
+// backlights, LPUART4 for the strip, LPUART7, FlexCAN3, LPI2C1, the ADC
+// channels) is unchanged. Pins 38/39 swap pads (plain GPIO here - harmless)
+// and pins 40-45 are new. The IMU on 40/41 is not driven by this firmware yet.
 // ---------------------------------------------------------------------------
 
 #pragma once
@@ -87,19 +113,149 @@ static const uint32_t BMS_ID_PCS_HEARTBEAT   = 0x305;
 // 1 s broadcast cycle -> allow a few missed frames before declaring it gone.
 static const uint32_t BMS_OFFLINE_MS = 5000;
 
-// --- analog input pins ----------------------------------------------------------
+// --- the two PDMs (dingoFW) ---------------------------------------------------------
+// Two identical 14-channel boxes running dingoFW (the "Shrimp" fork of
+// dingoPDM) switch every load in the car. PDM-E carries the engine: fans,
+// starter, fuel pump, coils, engine-switched feed. PDM-L carries lighting,
+// wipers and cabin loads. Forward lighting is split across both. Pin maps:
+// PDM_OUTPUTS further down; contract with dingoConfig: docs/PDM_CAN_SETUP.md.
+//
+// Each box owns a block of 11-bit ids starting at its Base ID (burned into
+// the box with dingoConfig): Base+0/+1 are dingoConfig's settings channel,
+// Base+2 upward are the cyclic status frames, all sent every 100 ms.
+//
+// THESE TWO BASE IDS ARE PLACEHOLDERS - set them to whatever the CAN id plan
+// assigns and burn the same numbers into the boxes. Neither sits on dingoFW's
+// factory default (0x0DE) on purpose: a replacement box that was never
+// configured then shows up as unk= traffic instead of impersonating a PDM.
+// 0x40 ids are reserved per box (stock dingoFW uses 32; the fork's frames
+// for outputs 9-14 need a few more).
+//
+// The index into g_data.pdm[] is the box's ROLE. Today role = box (the id
+// is burned in). If "the role follows the plug" is adopted, the role must
+// come from the strap inputs instead - can_bus.cpp maps id -> slot in one
+// place (pdmSlotForId) so that is the only code to change.
 
-// (Sept 2026 pin shuffle: brights/headlights moved from 22/25 onto 14/15,
-// which the DFPlayer vacated for Serial7 on 28/29 - see AUDIO_SERIAL - and
-// display 3's PWM moved from 4 to 22 so all three backlights share one
-// FlexPWM module - see PIN_BACKLIGHT. Pins 4 and 25 are now unused.)
+enum PdmId : uint8_t
+    {
+    PDM_E = 0, // engine box: its device faults can stop the car -> red
+    PDM_L,     // lighting/cabin box: its device faults are yellow
+    PDM_COUNT
+    };
+
+static const uint32_t PDM_BASE_ID[PDM_COUNT] = { 0x440, 0x480 }; // PLACEHOLDERS, see above
+static const uint32_t PDM_ID_BLOCK           = 0x40;             // ids reserved per box
+
+static const uint8_t  PDM_MAX_OUTPUTS = 14; // the Shrimp board; stock dingoPDM has 8
+
+// Status older than this is not trusted: the PDM alarms gate off and
+// PDME CAN / PDML CAN raises. Ten missed 100 ms frames.
+static const uint32_t PDM_FRESH_MS = 1000;
+
+// Current scale of the status frames. dingoFW d594cd7 sends WHOLE AMPS
+// ((uint16_t) cast of a float in msg.cpp, and the CAN docs say "A"); the
+// .dbc file in the same repo still says 0.1 A/bit. Source wins. If the
+// fork restores 0.1 A resolution, change this one number.
+static const float PDM_AMPS_PER_COUNT = 1.0f;
+
+// THE STATUS FRAME TABLE. One row per cyclic frame the gauge decodes, as an
+// offset from the box's Base ID - so the decoder follows whatever layout
+// the firmware defines without touching can_bus.cpp. Field packing per kind
+// (all little-endian, from dingoFW boards/dingopdm_v7/msg.cpp):
+//
+//   DEVICE    b0 digital inputs, b1 low nibble device state (0 Run, 1 Sleep,
+//             2 OverTemp, 3 Error) / high nibble board type, b2-3 total
+//             current, b4-5 battery V x10, b6-7 board temp C x10
+//   CURRENT   one uint16 per output (PDM_AMPS_PER_COUNT)
+//   STATE     one nibble per output, low nibble first (0 Off, 1 On,
+//             2 Overcurrent, 3 Fault). Only whole output-carrying bytes are
+//             read: the stock frame's wiper/flasher bytes are not outputs.
+//   OC_COUNT  one byte per output: overcurrent trips since the request went on
+//   DUTY      one byte per output: PWM duty %, only sent when PWM is enabled
+//
+// "need" says how the frame counts toward the box being ONLINE:
+//   PDM_NEED_ALWAYS     must keep arriving (stock frames dingoFW always sends)
+//   PDM_NEED_ONCE_SEEN  optional until it has arrived once, required after.
+//                       This is how the same gauge firmware runs against a
+//                       stock 8-output board on the bench (which never sends
+//                       the rows below the line) and against the fork.
+//   PDM_NEED_NEVER      decoded when present, never required
+//
+// THE ROWS FOR OUTPUTS 9-14 ARE A PROPOSAL: those frames do not exist in any
+// firmware yet. They are what this gauge will decode, so either build the
+// fork to this layout or edit the rows to match what the fork sends.
+
+enum PdmFrameKind : uint8_t
+    {
+    PDM_KIND_DEVICE = 0,
+    PDM_KIND_CURRENT,
+    PDM_KIND_STATE,
+    PDM_KIND_OC_COUNT,
+    PDM_KIND_DUTY,
+    };
+
+enum PdmFrameNeed : uint8_t
+    {
+    PDM_NEED_ALWAYS = 0,
+    PDM_NEED_ONCE_SEEN,
+    PDM_NEED_NEVER,
+    };
+
+struct PdmFrameDef
+    {
+    uint8_t      idOffset;    // CAN id = PDM_BASE_ID[box] + idOffset
+    PdmFrameKind kind;
+    uint8_t      firstOutput; // 0-based index of the first output in the frame
+    uint8_t      outputs;     // how many outputs the frame carries
+    PdmFrameNeed need;
+    };
+
+static const PdmFrameDef PDM_FRAMES[] =
+    {
+    //  id    kind               first  n   need
+    {  2, PDM_KIND_DEVICE,    0, 0, PDM_NEED_ALWAYS    }, // msg 0
+    {  3, PDM_KIND_CURRENT,   0, 4, PDM_NEED_ALWAYS    }, // msg 1: outputs 1-4
+    {  4, PDM_KIND_CURRENT,   4, 4, PDM_NEED_ALWAYS    }, // msg 2: outputs 5-8
+    {  5, PDM_KIND_STATE,     0, 8, PDM_NEED_ALWAYS    }, // msg 3: outputs 1-8
+    {  6, PDM_KIND_OC_COUNT,  0, 8, PDM_NEED_ALWAYS    }, // msg 4: outputs 1-8
+    { 25, PDM_KIND_DUTY,      0, 8, PDM_NEED_NEVER     }, // msg 23: outputs 1-8
+    // ---- PROPOSED fork frames for outputs 9-14 (see the note above) ----
+    { 32, PDM_KIND_CURRENT,   8, 4, PDM_NEED_ONCE_SEEN }, // outputs 9-12
+    { 33, PDM_KIND_CURRENT,  12, 2, PDM_NEED_ONCE_SEEN }, // outputs 13-14
+    { 34, PDM_KIND_STATE,     8, 6, PDM_NEED_ONCE_SEEN }, // outputs 9-14
+    { 35, PDM_KIND_OC_COUNT,  8, 6, PDM_NEED_ONCE_SEEN }, // outputs 9-14
+    { 36, PDM_KIND_DUTY,      8, 6, PDM_NEED_NEVER     }, // outputs 9-14
+    };
+static const uint8_t PDM_FRAME_COUNT = sizeof(PDM_FRAMES) / sizeof(PDM_FRAMES[0]);
+
+// --- what the gauge transmits to the PDMs ----------------------------------------------
+// The roof panel's six switches and five pots are wired to the gauge, not to
+// the PDMs. The gauge reads them and broadcasts two frames; each PDM picks
+// the bits it wants with dingoFW "CAN inputs". Layouts: docs/PDM_CAN_SETUP.md
+// and the top of can_bus.cpp. Like the PDM ids these two are PLACEHOLDERS.
+//
+// FAIL-ON LIGHTING: with its timeout enabled, dingoFW zeroes a CAN input
+// when the frame stops arriving. So the switch frame carries every switch
+// TWICE: an "on" bit and an "off" bit that is always its complement. A PDM
+// lamp output driven from NOT(off bit) comes ON when the gauge or the bus
+// dies; a load driven from the on bit goes OFF. Which behaviour each load
+// gets is a dingoConfig choice - the gauge always sends both.
+static const uint32_t GAUGE_ID_SWITCHES = 0x4C0; // switches, flags, alive counter
+static const uint32_t GAUGE_ID_POTS     = 0x4C1; // pot positions + fan PWM duty
+
+// Both frames go out every GAUGE_TX_PERIOD_MS, and at once (next 20 ms tick)
+// when a switch or a pot moves. Set each PDM CAN input's timeout to a few
+// periods (500 ms suggested).
+static const uint32_t GAUGE_TX_PERIOD_MS = 100;
+
+// --- analog input pins ----------------------------------------------------------
 
 static const uint8_t PIN_FUEL_SENDER = 23; // A9  - fuel sender divider node
 static const uint8_t PIN_ROTARY      = 24; // A10 - 12-position rotary divider
-static const uint8_t PIN_HEADLIGHTS  = 15; // A1  - 12V input via 100k/10k divider
-static const uint8_t PIN_BRIGHTS     = 14; // A0  - 12V input (high beam + light bars)
-static const uint8_t PIN_BLINKER_L   = 16; // A2  - 12V input
-static const uint8_t PIN_BLINKER_R   = 17; // A3  - 12V input
+
+// (The four 12V trigger inputs - headlights, brights, blinkers - are gone
+// from the board. Their pins 14-17 now read pots; the lamp states the
+// screens show come from the PDMs over CAN, see LAMP_* below.)
 
 // --- ADC configuration ----------------------------------------------------------
 
@@ -109,18 +265,18 @@ static const uint8_t  ADC_AVERAGING       = 16;   // hardware averaging: ~16x le
                                                   // still well under 0.1 ms per pin
 
 // --- fuel sender ----------------------------------------------------------------
-// Circuit (Schematic Ref.pdf, sheet 1):
+// Circuit (KiCad sheet "Analog Inputs"):
 //
 //   +3V3 --[R14 150R precision]--+-- FUEL_IN --> 2 x E30 sender in series --> GND
 //                                |
-//                          [R13 1k]--+-- FUEL_READ (pin 23)
-//                                    |
-//                               [C12 100n]
-//                                    |
-//                                   GND
+//                          [R13 2.2k]--+-- FUEL_READ (pin 23)
+//                                      |
+//                                 [C12 100n]
+//                                      |
+//                                     GND
 //
 // R14 and the senders form the divider; R13/C12 are only an RC filter on
-// the ADC pin (1.6 kHz corner). The ADC draws no DC current, so R13 drops
+// the ADC pin (720 Hz corner). The ADC draws no DC current, so R13 drops
 // nothing and the pin sees the divider node exactly. Divider and ADC share
 // the 3.3V rail, so the reading is RATIOMETRIC - the rail cancels out:
 //
@@ -245,41 +401,44 @@ static const uint32_t FUEL_FILL_CAN_MS  = 30000;
 static const uint32_t FUEL_FILL_FULL_MS = 60000;
 
 // --- rotary mode switch ----------------------------------------------------------
-// Circuit (Schematic Ref.pdf, sheet 1): the CTS 212 12-position switch
-// carries a chain of 11 x 220R resistors; its wiper picks a tap and the
-// far end of the chain returns to PCB ground. On the PCB a 2.2k pull-up
-// feeds the wiper node and a 10k/100n RC filters it into the ADC pin:
+// Circuit (KiCad sheet "Analog Inputs" - the same input cell as the roof
+// switches and pots): the 12-position switch selects one of 11 resistors
+// to PCB ground (position 0 is a dead short). On the PCB a 4.7k pull-up
+// feeds the wiper node, with the filter cap AT the connector and a 22k
+// series resistor protecting the ADC pin:
 //
-//   +3V3 --[R31 2.2k]--+-- DIAL_IN --> wiper --> k x 220R --> GND
+//   +3V3 --[R66 4.7k]--+-- DIAL_IN --> wiper --> Rk --> GND
 //                      |
-//                [R30 10k]--+-- DIAL_READ (pin 24)
-//                           |
-//                      [C15 100n]
-//                           |
-//                          GND
+//                 [C15 100n]      [R67 22k]
+//                      |      +------/\/\/------ DIAL_READ (pin 24)
+//                     GND     |
+//                  (DIAL_IN) -+
 //
-// So position k (0..11) presents Rk = k x 220R to ground and the pin sees
-// 3.3V x Rk / (Rk + 2200). That is NOT a linear voltage ladder - the steps
-// shrink toward the top (position 0->1 is 0.30 V, 10->11 is 0.08 V) - but
-// it IS linear in RESISTANCE, so inputs.cpp does what the fuel sender does:
-// convert counts to ohms ratiometrically (Rk = 2200 * f / (1 - f)), then
-// position = round(Rk / 220). Every decision boundary then sits halfway
-// between taps, +-110R of margin each. Expected readings:
+// The pin sees 3.3V x Rk / (Rk + 4700). The eleven resistor values are
+// chosen so those VOLTAGES are roughly evenly spaced (250-330 counts
+// apart), which means the resistances are not: the ladder runs 0R to 15k.
+// So inputs.cpp decides in the voltage domain - it compares the measured
+// divider ratio f = counts/4095 against each position's expected ratio
+// Rk/(Rk + 4700) and takes the nearest. Every boundary then sits halfway
+// between two neighbours, at least +-125 counts of margin each:
 //
-//   pos  0     0R  0.000 V     0 counts    pos  6  1320R  1.238 V  1536
-//   pos  1   220R  0.300 V   372           pos  7  1540R  1.359 V  1686
-//   pos  2   440R  0.550 V   683           pos  8  1760R  1.467 V  1820
-//   pos  3   660R  0.762 V   945           pos  9  1980R  1.563 V  1940
-//   pos  4   880R  0.943 V  1170           pos 10  2200R  1.650 V  2048
-//   pos  5  1100R  1.100 V  1365           pos 11  2420R  1.729 V  2145
+//   pos  0     0R  0.000 V     0 counts    pos  6  3.3k  1.361 V  1689
+//   pos  1   360R  0.235 V   291           pos  7  4.3k  1.577 V  1957
+//   pos  2   750R  0.454 V   564           pos  8  5.6k  1.794 V  2226
+//   pos  3  1.2k   0.671 V   833           pos  9  7.5k  2.029 V  2518
+//   pos  4  1.8k   0.914 V  1134           pos 10   10k  2.245 V  2786
+//   pos  5  2.4k   1.115 V  1384           pos 11   15k  2.513 V  3118
 //   open (wiper lifted / broken wire)     3.300 V  4095
 //
-// Margin budget at the top of the ladder, where one count is worth ~2.4R:
-// 1% resistors put the ratio off by up to ~50R, and the 10k filter resistor
-// turns any ADC input leakage into an offset (1 uA = 10 mV = ~30R). Against
-// a 110R half-step that is fine in practice but not lavish - if positions
-// 10 and 11 ever misread on the bench, shrink R30 first (1k, like the fuel
-// input) and tighten R31 to 0.1% second.
+// Margin budget: 1% resistors move a tap by at most ~20 counts, and the 22k
+// series resistor turns ADC input leakage into an offset of 27 counts per
+// microamp (the pad's worst case is about 1 uA hot; typical is far less).
+// Against a 125-count half-step that is comfortable.
+//
+// (History: until Nov 2026 this was a 2.2k pull-up into a chain of
+// 11 x 220R, decoded by rounding ohms. The input cell and the ladder both
+// changed with the MicroMod board; ROTARY_PULLUP_OHMS and ROTARY_OHMS are
+// the two things to edit if the ladder is ever rebuilt.)
 //
 // FAULT DETECTION (DIALFAIL): an open wiper - broken wire, dead switch, or
 // a non-shorting switch caught between detents - reads far above the last
@@ -294,11 +453,17 @@ static const uint32_t FUEL_FILL_FULL_MS = 60000;
 // indistinguishable from position 0, which is the fail-safe mode anyway.
 
 static const uint8_t  ROTARY_POSITIONS      = 12;
-static const float    ROTARY_PULLUP_OHMS    = 2200.0f; // R31
-static const float    ROTARY_STEP_OHMS      = 220.0f;  // one ladder resistor
-static const float    ROTARY_OPEN_OHMS      = 3000.0f; // last tap is 2420R; this is 2.6
-                                                       // steps past it and still less than
-                                                       // a quarter of the way to open (inf)
+static const float    ROTARY_PULLUP_OHMS    = 4700.0f; // R66
+// Resistance to ground at each detent, position 0 first (the note on the
+// schematic). Must stay in rising order.
+static const float    ROTARY_OHMS[ROTARY_POSITIONS] =
+    {
+       0.0f,  360.0f,  750.0f, 1200.0f, 1800.0f,  2400.0f,
+    3300.0f, 4300.0f, 5600.0f, 7500.0f, 10000.0f, 15000.0f,
+    };
+static const float    ROTARY_OPEN_OHMS      = 35000.0f; // 3610 counts: halfway (in volts)
+                                                        // between the last tap (3118)
+                                                        // and open (4095)
 static const uint8_t  ROTARY_DEBOUNCE_TICKS = 3;       // 3 x 20 ms = stable for 60 ms
 static const uint16_t ROTARY_OPEN_MS        = 2000;    // open this long = DIALFAIL + fail-safe
 static const uint8_t  ROTARY_FAILSAFE_POS   = 0;       // = MODE_BRIGHT in ROTARY_MODE_MAP
@@ -344,15 +509,228 @@ static const GaugeMode ROTARY_MODE_MAP[ROTARY_POSITIONS] =
     MODE_UNASSIGNED,   // position 11
     };
 
-// --- 12V switch inputs (headlights, brights, blinkers) -----------------------------
-// Each is 12V into a 100k/10k divider -> ~1.1-1.3V at the pin when on, ~0V when
-// off. Two thresholds (hysteresis) so a reading hovering near one threshold
-// can't flicker the state: must rise above ON to turn on, fall below OFF to
-// turn off.
-//   counts = volts / 3.3 * 4095
+// --- roof switch panel: six ground-switched inputs -----------------------------------
+// Circuit, per switch (KiCad sheet "Analog Inputs", J2 pins SW1..SW6, out
+// to the roof switch panel; each switch closes its wire to sensor ground):
+//
+//   +3V3 --[4.7k]--+-- SWn_IN --> switch --> GND
+//                  |
+//             [100n]      [22k]
+//                  |   +---/\/\/--- SWn_READ (Teensy pin)
+//                 GND -+
+//
+// Open switch = pin HIGH (3.3 V), closed = LOW (0 V). The 22k protects the
+// pin if the wire ever finds 12 V. Two firmware consequences:
+//   * NO internal pull-up. The chip's pull-up is ~22k; against the 22k
+//     series resistor a closed switch would sit at 1.65 V, right on the
+//     logic threshold. The external 4.7k is the only pull-up.
+//   * The input needs its Schmitt trigger: releasing a switch is a slow
+//     edge (4.7k x 100n = 0.47 ms) that a plain CMOS input may chatter on.
+//     pinMode(INPUT) leaves hysteresis off, so inputs.cpp sets the pad's
+//     HYS bit itself.
+//
+// These six switches request the lights. The gauge does not decide what any
+// of them DOES - it debounces them and broadcasts their states, and each
+// PDM's dingoConfig maps bits to outputs (docs/PDM_CAN_SETUP.md).
 
-static const int SWITCH_ON_COUNTS  = 745; // ~0.60 V at the pin (~6 V at the input)
-static const int SWITCH_OFF_COUNTS = 496; // ~0.40 V at the pin (~4 V at the input)
+static const uint8_t ROOF_SWITCH_COUNT = 6;
+static const uint8_t PIN_ROOF_SWITCH[ROOF_SWITCH_COUNT] = { 7, 32, 42, 43, 44, 45 }; // SW1..SW6
+
+// true = the switch is ON when it closes to ground (pin LOW). Flip an entry
+// for a switch wired the other way round (ON = open), e.g. to make a broken
+// wire read as "on" for that function.
+static const bool ROOF_SWITCH_ON_WHEN_CLOSED[ROOF_SWITCH_COUNT] =
+    { true, true, true, true, true, true };
+
+static const uint8_t ROOF_SWITCH_DEBOUNCE_TICKS = 3; // 3 x 20 ms = stable for 60 ms
+
+// --- roof switch panel: five pots ----------------------------------------------------
+// Each pot input is the same cell as a switch input (4.7k pull-up, 100n,
+// 22k into an ADC pin) with ONE wire per pot on J2 - so each pot is wired
+// as a two-terminal rheostat to sensor ground, and the pin sees
+// 3.3V x Rpot / (Rpot + 4700). Like the fuel sender that is ratiometric and
+// linear in RESISTANCE, so inputs.cpp converts counts -> ohms -> percent of
+// travel. (The schematic's note "pot channels can read switches": a switch
+// on a pot input reads 0R closed and open-circuit open - see POT_OPEN_OHMS.)
+//
+// What each pot is FOR (assumed from the harness: PWM1 -> defrost fan,
+// PWM2/3 -> seat fans, PDM-L outputs 13/14 -> coolshirt pumps). CHANGE THIS
+// if the panel is laid out differently - nothing else depends on the order:
+//
+//   pot 1  defrost fan speed          -> fan PWM 1 + CAN
+//   pot 2  driver seat fan speed      -> fan PWM 2 + CAN
+//   pot 3  co-driver seat fan speed   -> fan PWM 3 + CAN
+//   pot 4  driver coolshirt pump      -> CAN only (PDM-L PWMs output 13)
+//   pot 5  co-driver coolshirt pump   -> CAN only (PDM-L PWMs output 14)
+
+static const uint8_t POT_COUNT = 5;
+static const uint8_t PIN_POT[POT_COUNT] = { 14, 15, 16, 17, 25 }; // POT1..POT5 = A0..A3, A11
+
+static const float POT_PULLUP_OHMS = 4700.0f; // R57/R59/R61/R63/R65
+
+// Per-pot calibration: the resistance at each end of travel. 0% is where the
+// load should be OFF. MEASURE ON THE PANEL (the 1 Hz debug print shows each
+// pot's ohms): 10k linear pots are ASSUMED here, wired so that fully
+// counter-clockwise is 0R. If a knob works backwards, swap its two numbers.
+// With a 10k pot the pin spans 0..2.24 V (0..2786 counts), ~28 counts per
+// percent - plenty.
+struct PotCal
+    {
+    float   ohmsAt0;      // resistance at the 0 % (off) end of travel
+    float   ohmsAt100;    // resistance at the 100 % end
+    uint8_t failsafePct;  // what to report while the pot reads open-circuit
+    };
+
+static const PotCal POT_CAL[POT_COUNT] =
+    {
+    //  0 %      100 %    failsafe
+    { 0.0f, 10000.0f, 100 }, // pot 1 defrost: a broken wire leaves the screen clearing
+    { 0.0f, 10000.0f,   0 }, // pot 2 seat fan, driver
+    { 0.0f, 10000.0f,   0 }, // pot 3 seat fan, co-driver
+    { 0.0f, 10000.0f,   0 }, // pot 4 coolshirt, driver
+    { 0.0f, 10000.0f,   0 }, // pot 5 coolshirt, co-driver
+    };
+
+// Above this the wire is open (broken, unplugged): the pull-up drags the
+// node to the rail. Three times a 10k pot's full travel, 3540 counts.
+static const float POT_OPEN_OHMS = 30000.0f;
+static const uint16_t POT_OPEN_MS = 500; // open this long = fault + failsafe value
+
+// Pots are noisy, mechanical things. Three small filters keep the CAN value
+// and the fan duty from dithering:
+static const float POT_FILTER_TAU_S   = 0.10f; // EMA on the percent reading
+static const float POT_END_DEADBAND   = 3.0f;  // within this of either end = exactly 0 / 100
+static const float POT_ON_PCT         = 6.0f;  // "active" (load wanted) above this...
+static const float POT_OFF_PCT        = 3.0f;  // ...and inactive again below this
+static const float POT_REPORT_STEP    = 1.0f;  // the published percent only moves once the
+                                               // filtered value is this far from it
+
+// --- cabin fan PWM outputs -----------------------------------------------------------
+// Three logic-level PWM signals leave the board on J2 (PWM1..PWM3) for the
+// speed-control inputs of the 12V cabin fans: PWM1 -> defrost fan, PWM2 ->
+// driver seat fan, PWM3 -> co-driver seat fan. The fans' POWER comes from
+// PDM-L (outputs 11 and 12); the gauge only tells them how fast. So a fan
+// is off because the PDM switched it off (the gauge sends each pot's
+// "active" bit for exactly that), not because its PWM is at zero - most
+// PWM-input fans idle at minimum speed on 0 % rather than stop.
+//
+// As drawn (Nov 2026) the three pins go STRAIGHT from the MicroMod to J2:
+// 3.3 V push-pull, no buffer, no series resistor. High time = speed, the
+// 4-wire fan convention. If an open-drain stage is ever added (the unused
+// pwm.kicad_sch has three 2N7002s), the FET inverts the signal - flip
+// FAN_PWM_ACTIVE_HIGH and nothing else.
+//
+// All three are FlexPWM2 (pins 4 and 33 share submodule 0, pin 5 is
+// submodule 1), so one frequency serves all. 25 kHz is the 4-wire fan
+// standard (21-28 kHz) and sits above hearing.
+
+static const uint8_t FAN_COUNT = 3;
+static const uint8_t PIN_FAN_PWM[FAN_COUNT] = { 4, 5, 33 }; // PWM1..PWM3
+
+// Which pot sets each fan's speed (index into PIN_POT, 0 = pot 1).
+static const uint8_t FAN_POT[FAN_COUNT] = { 0, 1, 2 };
+
+static const float FAN_PWM_HZ         = 25000.0f;
+static const bool  FAN_PWM_ACTIVE_HIGH = true;
+
+// Duty sent for pot travel just above "active" and at full travel; the pot
+// maps linearly between them. Most fans stall or ignore duty below ~20 %.
+// TUNE per fan on the bench. While a pot is inactive its fan gets 0 %.
+static const float FAN_MIN_DUTY_PCT = 20.0f;
+static const float FAN_MAX_DUTY_PCT = 100.0f;
+
+// --- PDM output catalogue ------------------------------------------------------------
+// What hangs on each output of each box (vehicle harness rev A). The alarm
+// system classes PDM faults BY CONSEQUENCE, not by channel: 28 outputs
+// collapse to four classes, each with one alarm row per severity. The
+// 4-character tag is what the banner shows next to the status:
+//
+//   TRP  tripped on overcurrent and retrying
+//   FLT  off and staying off (dingoFW "Fault", or stuck in overcurrent)
+//   OPN  commanded on but drawing nothing (blown fuse link, unplugged load)
+//
+// OPN needs a load whose normal current is far above the BTS7002's ~0.5 A
+// measurement floor, so only the pump and the fans get one (openAmps > 0).
+// Coils idle near the floor; LED lamps sit under it.
+
+enum LoadClass : uint8_t
+    {
+    LOAD_NONE = 0, // spare output: never judged
+    LOAD_ENGINE,   // losing it stops the car: pump, coils, engine-switched feed
+    LOAD_COOLING,  // radiator fans
+    LOAD_VISION,   // what the crew sees with: lamps, wipers, defrost
+    LOAD_BODY,     // everything that can wait for service
+    };
+
+struct PdmOutputDef
+    {
+    const char* tag;      // exactly 4 characters
+    LoadClass   cls;
+    float       openAmps; // OPN when On and below this many amps; 0 = no OPN check
+    uint16_t    openMs;   // ...for this long
+    };
+
+static const PdmOutputDef PDM_OUTPUTS[PDM_COUNT][PDM_MAX_OUTPUTS] =
+    {
+    // ---- PDM-E ----
+        {
+        { "FAN1", LOAD_COOLING, 2.0f, 2000 }, //  1 radiator fan A (expect 20-22 A)
+        { "FAN2", LOAD_COOLING, 2.0f, 2000 }, //  2 radiator fan B
+        { "STRT", LOAD_BODY,    0.0f,    0 }, //  3 starter solenoid A
+        { "STRT", LOAD_BODY,    0.0f,    0 }, //  4 starter solenoid B
+        { "PUMP", LOAD_ENGINE,  2.0f, 1000 }, //  5 fuel pump (expect 7.9-9.1 A)
+        { "COIL", LOAD_ENGINE,  0.0f,    0 }, //  6 ignition coils
+        { "MAIN", LOAD_ENGINE,  0.0f,    0 }, //  7 engine switched: injectors, VANOS, ECU
+        { "YLLO", LOAD_VISION,  0.0f,    0 }, //  8 yellow lamps, low
+        { "YLHI", LOAD_VISION,  0.0f,    0 }, //  9 yellow lamps, high
+        { "WIDE", LOAD_VISION,  0.0f,    0 }, // 10 light bar, wide
+        { "BRAK", LOAD_BODY,    0.0f,    0 }, // 11 brake lights
+        { "HORN", LOAD_BODY,    0.0f,    0 }, // 12 horn
+        { "SPR1", LOAD_NONE,    0.0f,    0 }, // 13 spare
+        { "SPR2", LOAD_NONE,    0.0f,    0 }, // 14 spare
+        },
+    // ---- PDM-L ----
+        {
+        { "LOBM", LOAD_VISION,  0.0f,    0 }, //  1 low beam
+        { "HIBM", LOAD_VISION,  0.0f,    0 }, //  2 high beam
+        { "SPOT", LOAD_VISION,  0.0f,    0 }, //  3 light bar, spot
+        { "TRNL", LOAD_BODY,    0.0f,    0 }, //  4 turn left
+        { "TRNR", LOAD_BODY,    0.0f,    0 }, //  5 turn right
+        { "TAIL", LOAD_BODY,    0.0f,    0 }, //  6 tail + plate
+        { "REVS", LOAD_BODY,    0.0f,    0 }, //  7 reverse
+        { "WIPR", LOAD_VISION,  0.0f,    0 }, //  8 wiper low + module power
+        { "WIPH", LOAD_VISION,  0.0f,    0 }, //  9 wiper high select
+        { "WASH", LOAD_BODY,    0.0f,    0 }, // 10 washer
+        { "DFRS", LOAD_VISION,  0.0f,    0 }, // 11 defrost fan
+        { "SEAT", LOAD_BODY,    0.0f,    0 }, // 12 seat fans
+        { "SHRD", LOAD_BODY,    0.0f,    0 }, // 13 coolshirt pump, driver
+        { "SHRC", LOAD_BODY,    0.0f,    0 }, // 14 coolshirt pump, co-driver
+        },
+    };
+
+// --- lamp indicators: which PDM outputs light which icon -------------------------------
+// The four icons on the PSI/lambda screen (and night mode) used to read 12V
+// trigger wires. They now read the PDMs' own output states, so an icon shows
+// what the box is actually driving - a tripped lamp output reads as off.
+// A turn output carries the flasher's on/off wave, so the raw state IS the
+// blink (at the 100 ms resolution of the status frames).
+
+struct PdmOutputRef
+    {
+    uint8_t pdm;    // PDM_E / PDM_L
+    uint8_t output; // 0-based: output 1 = 0
+    };
+
+// "Headlights" = any dipped set. Also what flips the gauge to night colors.
+static const PdmOutputRef LAMP_HEADLIGHTS[] = { { PDM_L, 0 },   // low beam
+                                                { PDM_E, 7 } }; // yellow low
+// "Brights" = any main-beam or auxiliary set.
+static const PdmOutputRef LAMP_BRIGHTS[]    = { { PDM_L, 1 },   // high beam
+                                                { PDM_L, 2 },   // light bar, spot
+                                                { PDM_E, 8 },   // yellow high
+                                                { PDM_E, 9 } }; // light bar, wide
+static const PdmOutputRef LAMP_TURN_L[]     = { { PDM_L, 3 } };
+static const PdmOutputRef LAMP_TURN_R[]     = { { PDM_L, 4 } };
 
 // --- injection mode ----------------------------------------------------------------
 // Sequential injection (rusEFI on the M54): each injector fires once per
@@ -458,6 +836,43 @@ static const float VOLT_HIGH_WARN_V = 15.5f; // TUNE: plan lists VLT HIGH but no
                                              // set vs the LTO pack's max charge voltage
 static const float VOLT_HYST_V      = 0.2f;
 
+// Second VOLT LOW trigger: the pack is DISCHARGING with the engine above
+// idle. A dead alternator shows here first - the LTO pack holds the bus
+// above 13.2 V for a long while as it drains, so the voltage rule alone
+// would stay quiet until most of the runtime is gone. The BMS frame is
+// 1 Hz, so the persistence below is about ten samples. TUNE all three from
+// a log: the amps must sit above the worst brief discharge a healthy
+// alternator allows (fans + lights kicking in at low rpm).
+static const float    VOLT_DISCHARGE_AMPS    = 10.0f; // pack amps, + = discharge
+static const uint32_t VOLT_DISCHARGE_MS      = 10000; // ...for this long
+static const uint16_t VOLT_DISCHARGE_MIN_RPM = 1500;  // "above idle"
+
+// --- PDM alarms ------------------------------------------------------------------------
+// dingoFW reports its board temperature; at BOARD_TEMP_CRIT (80 C, stock)
+// it latches EVERY output off until a power cycle. The gauge warns on the
+// way there: yellow at latch - 15 K, red (PDM-E only: that box can stop
+// the car) at latch - 5 K. If the fork moves or replaces the latch (staged
+// shedding), PDM_LATCH_TEMP_C is the one number to follow it with.
+// UNTESTED against a real board: nobody has measured the Shrimp board's
+// temperature rise at stage load. If it runs hotter than ~65 C in a hot
+// cabin the yellow will nag - bench it at 60 A before trusting these.
+static const float PDM_LATCH_TEMP_C      = 80.0f;
+static const float PDM_HOT_WARN_MARGIN_C = 15.0f; // yellow at 65 C
+static const float PDM_HOT_CRIT_MARGIN_C = 5.0f;  // red at 75 C (PDM-E)
+static const float PDM_TEMP_HYST_C       = 2.0f;
+
+// A trip is not red; losing an engine-class output for about two seconds is.
+// "Stuck" = the output spent PDM_OC_STUCK_MS of the last PDM_OC_WINDOW_MS in
+// dingoFW's Overcurrent state (off, waiting out its reset time). A single
+// trip with a ~1 s reset time stays under the line; an output that trips
+// again the moment it retries crosses it on the third attempt.
+static const uint32_t PDM_OC_WINDOW_MS = 5000;
+static const uint32_t PDM_OC_STUCK_MS  = 2000;
+
+// A trip only lasts the PDM's reset time (could be 200 ms). The TRP banner
+// is held this long after each trip so the crew can actually read it.
+static const uint32_t PDM_TRIP_HOLD_MS = 10000;
+
 // battery pack cells (from the BMS)
 static const float CELL_BAL_WARN_V = 0.10f; // max-min cell spread
 static const float CELL_LOW_CRIT_V = 2.0f;  // any (= the minimum) cell below this
@@ -482,8 +897,8 @@ static const float FUEL_SENDER_VETO_PCT = 25.0f;
 // --- audio: DFPlayer Mini -----------------------------------------------------------
 // The module speaks 9600-baud serial on Serial7: pin 29 (TX7 -> module RX)
 // and pin 28 (RX7 <- module TX), per the pinout table ("MP3 Serial TX/RX").
-// It moved off Serial3 (pins 14/15) in the Sept 2026 pin shuffle so those
-// two analog-capable pins could take the brights/headlights inputs.
+// It moved off Serial3 (pins 14/15) in the Sept 2026 pin shuffle to free
+// those two analog-capable pins (they read pots 1 and 2 today).
 // Driver in audio.cpp.
 
 static HardwareSerial& AUDIO_SERIAL = Serial7;
@@ -515,7 +930,10 @@ static const uint32_t AUDIO_FINISH_GUARD_MS = 400;
 // --- LED tachometer: WS2812B strip ---------------------------------------------------
 // One 15-LED WS2812B strip (96/m, "v6" silicon = accepts our 3.3V data line
 // directly), reflected onto the windshield. Driven by the WS2812Serial
-// library on pin 8 ("LED Serial" in the pinout = Serial2 TX): the library
+// library on pin 8 ("LED Serial" in the pinout = LPUART4's TX). The library
+// picks the UART from the PIN NUMBER, so it is untouched by the MicroMod
+// core numbering its SerialN objects differently from the Teensy 4.0's
+// (there, Serial2 is no longer the port on pins 7/8). It
 // encodes the LED bitstream into serial framing and a DMA engine clocks it
 // out on its own, so repainting the strip costs the superloop microseconds.
 // Repainted on the 20 ms tick = 50 Hz (rpm itself updates at the rusEFI CAN
@@ -531,13 +949,49 @@ static const uint32_t AUDIO_FINISH_GUARD_MS = 400;
 
 static const uint8_t PIN_LED_STRIP = 8;
 
-static const uint8_t LED_COUNT       = 15;
+static const uint8_t LED_COUNT       = 15; // the tach strip: status + tach blocks
 static const uint8_t LED_STATUS_LEDS = 3;  // left block: vehicle status
 static const uint8_t LED_TACH_LEDS   = 12; // right block: the tachometer
 
 // If the strip ends up physically mounted with its input wire on the RIGHT,
-// flip this instead of rewiring - it mirrors the whole strip in software.
+// flip this instead of rewiring - it mirrors the tach strip in software.
+// (Only the 15 tach LEDs mirror; the label backlights below keep their
+// place at the end of the chain either way.)
 static const bool LED_STRIP_REVERSED = false;
+
+// LABEL BACKLIGHTS. More WS2812s are wired onto the END of the tach strip's
+// data chain (the 16th LED onward) to light the labels under the switches
+// on the roof panel and the dash. They are not part of the tach: one fixed
+// color, a brightness that follows the dial, and they never flash - not
+// for the shift light, not for a red alarm. A flashing label is a label
+// you cannot read at the moment you are reaching for the switch.
+//
+// SET LED_BACKLIGHT_COUNT TO THE NUMBER ACTUALLY WIRED (0 = none). Too high
+// costs nothing but 30 us of frame per LED; too low leaves the extra LEDs
+// showing whatever they powered up with.
+//
+// Because they share the tach's data line they are re-sent with every tach
+// frame (50 Hz), but their VALUES only change when the dial or night mode
+// does. They must be the same protocol as the tach strip (3-byte, GRB
+// order): an RGBW or RGB-order part will show wrong colors.
+//
+// 5V budget: one color at these levels is 3-12 mA per LED, so a dozen
+// labels cost under 150 mA. Full white would be 60 mA each - the reason the
+// colors below are single-channel-dominant.
+static const uint8_t LED_BACKLIGHT_COUNT = 12; // PLACEHOLDER - set to the build
+static const uint8_t LED_TOTAL_COUNT     = LED_COUNT + LED_BACKLIGHT_COUNT;
+
+static const uint32_t LED_COLOR_BACKLIGHT_DAY   = 0xFFFFFF; // white
+static const uint32_t LED_COLOR_BACKLIGHT_NIGHT = 0xFF5000; // the tach's night orange:
+                                                            // no blue for dark-adapted eyes
+
+// Backlight brightness per dial mode (0..255), separate from the tach's:
+// labels want to be readable, not eye-catching. Every other mode (Silent,
+// Fuel Reset, Debug, unassigned) uses MEDIUM; Displays Off turns them off
+// with everything else. TUNE on the car at night.
+static const uint8_t LED_BACKLIGHT_BRIGHT = 120;
+static const uint8_t LED_BACKLIGHT_MEDIUM = 50;
+static const uint8_t LED_BACKLIGHT_DARK   = 12;
 
 // Tach scale: tach LED k (k = 0..11) lights once rpm reaches
 //     TACH_START_RPM + k * TACH_STEP_RPM
@@ -836,8 +1290,8 @@ static const uint32_t FRAM_SIZE_BYTES  = 131072;  // 128 KB
 // Async write-queue geometry (fram.cpp). Worst case per 1 s tick is three
 // writes (log record + head pointer + fuel record), so depth 8 is generous.
 static const uint8_t  FRAM_QUEUE_DEPTH     = 8;
-static const uint8_t  FRAM_MAX_WRITE       = 32;  // largest single record
-static const uint32_t FRAM_XFER_TIMEOUT_MS = 5;   // one 34-byte transfer takes ~0.3 ms;
+static const uint8_t  FRAM_MAX_WRITE       = 40;  // largest single record (the log's)
+static const uint32_t FRAM_XFER_TIMEOUT_MS = 5;   // one 42-byte transfer takes ~0.4 ms;
                                                   // 5 ms of silence = the bus is wedged
 static const uint8_t  FRAM_MAX_CONSEC_ERRS = 8;   // give up (mark chip absent) after this
                                                   // many back-to-back failures
@@ -853,8 +1307,8 @@ static const uint32_t FRAM_ADDR_LOG    = 0x0400; // black-box ring, to end of ch
 // Black-box cadence. Records are written on the 1 s tick while the engine
 // runs (or a real alarm is active - see fram_log.cpp for the gating), every
 // LOG_NOMINAL_EVERY_S seconds normally and every LOG_ALARM_EVERY_S once any
-// yellow/red alarm is up. At 32 B/record the ~127 KB ring holds 4064
-// records: ~2.2 h of nominal running, ~68 min if an alarm is active the
+// yellow/red alarm is up. At 40 B/record the ~127 KB ring holds 3251
+// records: ~1.8 h of nominal running, ~54 min if an alarm is active the
 // whole time. After the engine stops (or the alarm clears) logging continues
 // for LOG_GRACE_MS - the aftermath of a stall is exactly the data you want -
 // then halts so a car left sitting with the ignition on doesn't grind away

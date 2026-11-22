@@ -7,7 +7,9 @@
 //     input modules (can_bus, inputs)  --write-->  g_data  --read-->  consumers
 //                                                            (alarms, audio,
 //                                                             screens, LED tach,
-//                                                             FRAM log)
+//                                                             FRAM log, fan PWM,
+//                                                             the CAN frames the
+//                                                             gauge sends the PDMs)
 //
 // Why one big struct instead of values scattered across modules?
 //   * Every consumer sees a consistent snapshot - there is exactly one place
@@ -235,14 +237,103 @@ struct FuelData
     bool    fillFullDone;   // full-tank reset applied during this visit
     };
 
+// --- values decoded from the two PDMs ---------------------------------------------
+// dingoFW's cyclic status frames (docs/PDM_CAN_SETUP.md; frame table:
+// PDM_FRAMES in config.h). can_bus.cpp writes the raw fields; pdm.cpp adds
+// the per-output verdicts the alarm rows are built on.
+
+// dingoFW's output states, verbatim from the status frame's nibbles.
+static const uint8_t PDM_STATE_OFF         = 0;
+static const uint8_t PDM_STATE_ON          = 1;
+static const uint8_t PDM_STATE_OVERCURRENT = 2; // off, waiting out its reset time, will retry
+static const uint8_t PDM_STATE_FAULT       = 3; // off until the PDM is power cycled
+
+// dingoFW's device states (status frame 0, low nibble of byte 1).
+static const uint8_t PDM_DEV_RUN      = 0;
+static const uint8_t PDM_DEV_SLEEP    = 1;
+static const uint8_t PDM_DEV_OVERTEMP = 2; // board above 55 C; outputs stay on
+static const uint8_t PDM_DEV_ERROR    = 3; // fatal: every output off until power cycle
+
+// What pdm.cpp concludes about one output, worst first. This is the word the
+// banner prints after the load tag.
+enum PdmVerdict : uint8_t
+    {
+    PDM_OUT_OK = 0,
+    PDM_OUT_TRP, // tripped within the last PDM_TRIP_HOLD_MS (and recovered, or retrying)
+    PDM_OUT_OPN, // on, but drawing less than its catalogue says it must
+    PDM_OUT_FLT, // dingoFW Fault, or stuck in Overcurrent
+    };
+
+struct PdmOutput
+    {
+    // -- raw, from the status frames (can_bus.cpp) --
+    uint8_t state;      // PDM_STATE_*
+    float   amps;       // output current (0 below the driver's ~0.5 A floor)
+    uint8_t ocCount;    // overcurrent trips since the request went on (wraps at 255)
+    uint8_t dutyPct;    // PWM duty, when the output is PWMed
+
+    // -- derived each tick (pdm.cpp) --
+    bool       valid;   // the frames carrying this output's state + current are fresh
+    PdmVerdict verdict; // PDM_OUT_OK while !valid: stale data raises nothing
+    bool       stuck;   // spent PDM_OC_STUCK_MS of the last PDM_OC_WINDOW_MS in Overcurrent
+    uint16_t   trips;   // trips counted since boot (for the debug print)
+    };
+
+struct PdmData
+    {
+    // status frame 0
+    uint8_t digInBits;      // the box's own digital inputs 1-2 (bit 0, bit 1)
+    uint8_t deviceState;    // PDM_DEV_*
+    uint8_t boardType;      // 0 dingoPDM, 1 dingoPDM-Max (the fork may add its own)
+    float   totalAmps;
+    float   battVolts;
+    float   boardTempC;
+
+    PdmOutput out[PDM_MAX_OUTPUTS];
+
+    // bookkeeping, one slot per row of PDM_FRAMES
+    uint32_t frameLastRxMs[PDM_FRAME_COUNT]; // 0 = never received
+    uint32_t frameCount;                     // decoded status frames since boot
+    };
+
+// --- lamp states, resolved from the PDMs ------------------------------------------
+// What the indicator icons draw and what flips the gauge to night colors.
+// pdm.cpp ORs the PDM outputs listed in config.h (LAMP_*) each tick. When a
+// source box is stale its lamps read OFF - an icon must not freeze lit on
+// dead data - but nightHint keeps its last known value: losing a CAN link
+// in the dark must not flip every screen back to daytime blue.
+
+struct LampData
+    {
+    bool headlights; // a dipped lamp set is on
+    bool brights;    // a main-beam / auxiliary set is on
+    bool turnL;      // carries the flasher's on/off wave, so drawing the raw
+    bool turnR;      //  state IS the blink (gauge_render.cpp)
+    bool nightHint;  // headlights, held through a stale link (modes.cpp)
+    };
+
+// --- roof switch panel + pots ------------------------------------------------------
+
+struct PotData
+    {
+    uint16_t rawCounts; // raw ADC reading (calibration aid)
+    float    ohms;      // rheostat resistance this tick
+    float    pct;       // 0..100 % of travel: filtered, end-deadbanded, and only
+                        //  republished when it has moved POT_REPORT_STEP. While
+                        //  the pot reads open this is its failsafe value.
+    bool     active;    // above the on/off threshold (with hysteresis): the
+                        //  load this pot controls is wanted
+    bool     open;      // wire open for POT_OPEN_MS: pct is the failsafe
+    };
+
 // --- driver switchgear -----------------------------------------------------------
 
 struct SwitchData
     {
-    bool headlights;        // raw electrical state of each 12V input. The
-    bool brights;           // blinker inputs carry the flasher's on/off wave
-    bool blinkerL;          // itself, so drawing the raw state on screen IS
-    bool blinkerR;          // the blink (gauge_render.cpp)
+    bool    roof[ROOF_SWITCH_COUNT]; // debounced; true = that switch is ON
+    uint8_t roofBits;                // the same, packed: bit 0 = SW1 ... bit 5 = SW6
+
+    PotData pot[POT_COUNT];
 
     uint8_t  rotaryPos;       // 0..11, debounced. While the dial reads OPEN
                               //  it holds the last good position, and after
@@ -250,7 +341,7 @@ struct SwitchData
                               //  ROTARY_FAILSAFE_POS (inputs.cpp)
     uint16_t rotaryRawCounts; // raw ADC (debug/diagnosis of a dirty ladder)
     float    rotaryOhms;      // wiper-to-ground resistance the ladder math
-                              //  derived this tick (position k ~ k x 220 R)
+                              //  derived this tick (compare ROTARY_OHMS)
     bool     rotaryOpen;      // debounced: the wiper reads open-circuit
                               //  (broken wire / dead switch). The DIALFAIL
                               //  alarm adds persistence on top of this.
@@ -276,8 +367,11 @@ struct ModeData
     bool      silent;           // no voice clips, no flashing alarms
     bool      displaysOff;      // all LEDs dark, screens black, backlights off
     bool      night;            // use the night color scheme (dim colors, no blue
-                                //  glare): headlights on, or Dark mode selected
+                                //  glare): headlights on (as the PDMs report
+                                //  them), or Dark mode selected
     uint8_t   ledBrightness;    // 0..255 global LED scale for this tick
+    uint8_t   labelBrightness;  // 0..255 level for the switch-label backlights
+                                //  on the end of the LED chain (led_tach.cpp)
     uint8_t   screenBrightness; // 0..255 backlight level for this tick (before
                                 //  per-screen trim - that lives in backlight.cpp)
     };
@@ -312,12 +406,47 @@ struct FramData
                           // nonzero value means the pump isn't keeping up
     };
 
+// --- cabin fan PWM (fans.cpp) -------------------------------------------------------
+
+struct FanData
+    {
+    uint8_t dutyPct[FAN_COUNT]; // speed being commanded on each PWM pin, 0..100 %
+    };
+
+// --- the last PDM output event, for the black box ----------------------------------
+// pdm.cpp records every change for the worse on any output (a trip, an open
+// load, a fault); fram_log.cpp writes the most recent one into its next
+// record and clears 'pending'. If several land in the same second the worst
+// verdict wins - the log is a backup, not a sequence-of-events recorder.
+
+struct PdmEventData
+    {
+    bool     pending;  // not yet written to the log
+    uint8_t  pdm;      // PDM_E / PDM_L
+    uint8_t  output;   // 0-based
+    uint8_t  verdict;  // PdmVerdict
+    float    amps;     // a trip: the highest current seen while the output was
+                       //  on; otherwise the current when the verdict changed
+    uint16_t count;    // events since boot
+    };
+
 // --- the warning/alarm system --------------------------------------------------------
-// The alarm catalog from the project plan's "Text warnings" list. The enum is
-// ordered BY PRIORITY (most important first), so "scan the array from 0 and
-// take the first active entry" IS the priority arbitration - no sorting
-// needed anywhere. Names, colors and behavior live in the definition table
-// in alarms.cpp, in this exact order.
+// The alarm catalogue: the project plan's "Text warnings" list, re-ordered
+// and extended with the PDM rows by the Nov 2026 alarm structure
+// (gauge-alarm-structure-pdm.md). The enum is ordered BY PRIORITY (most
+// important first), so "scan the array from 0 and take the first active
+// entry" IS the priority arbitration - no sorting needed anywhere. Names,
+// colors and behavior live in the definition table in alarms.cpp, in this
+// exact order. The numbers in the comments are the catalogue's row numbers.
+//
+// The four rules the order encodes:
+//   red     the crew must act NOW and acting changes the outcome
+//   yellow  "live": change how you drive or what is switched on
+//   yellow  "deferred": nothing to do until the car stops
+//   blue    information
+// (Hiding the deferred and blue rows at stage pace - the "pace gate" - is
+// NOT implemented: that was deferred on 21 Nov 2026. The table carries each
+// row's tier so the gate is a small change when it comes.)
 
 enum AlarmColor : uint8_t
     {
@@ -327,38 +456,54 @@ enum AlarmColor : uint8_t
     ALARM_RED        // critical - needs action NOW
     };
 
+enum AlarmTier : uint8_t
+    {
+    TIER_LIVE = 0,   // worth showing at any speed
+    TIER_DEFERRED,   // could wait for the car to stop (see the note above)
+    };
+
 enum AlarmId : uint8_t
     {
-    ALARM_OIL_LOW_CRIT = 0, // P1  OIL LOW  red
-    ALARM_CLT_HOT_CRIT,     // P2  CLT HOT  red
-    ALARM_AFR_LEAN_CRIT,    // P3  AFR LEAN red
-    ALARM_OIL_HOT_CRIT,     // P4  OIL HOT  red
-    ALARM_VOLT_LOW_CRIT,    // P5  VOLT LOW red
-    ALARM_CELL_LOW_CRIT,    // P6  CELL LOW red
-    ALARM_BATT_HOT_CRIT,    // P7  BATT HOT red
-    ALARM_NO_GAS,           // P8  NO GAS   red
-    ALARM_OIL_LOW_WARN,     // P9  OIL LOW  yellow
-    ALARM_VOLT_LOW_WARN,    // P10 VOLT LOW yellow
-    ALARM_CLT_HOT_WARN,     // P11 CLT HOT  yellow
-    ALARM_OIL_HOT_WARN,     // P12 OIL HOT  yellow
-    ALARM_AFR_LEAN_WARN,    // P13 AFR LEAN yellow
-    ALARM_CELL_BAL,         // P13 CELL BAL yellow (plan has two P13s; this order breaks the tie)
-    ALARM_BATT_HOT_WARN,    // P14 BATT HOT yellow
-    ALARM_VOLT_HIGH_WARN,   // P15 VLT HIGH yellow
-    ALARM_OIL_HIGH_WARN,    // P16 OIL HIGH yellow
-    ALARM_FUEL_LOW,         // P17 FUEL LOW yellow
-    ALARM_BATT_CAN,         // P18 BATT CAN yellow (BMS link lost)
-    ALARM_NO_CAN,           // P19 NO CAN   yellow (ECU link lost)
-    ALARM_DIAL_FAIL,        // P20 DIALFAIL yellow (rotary mode switch reads
-                            //     open - added after the plan's list; sits
-                            //     with the other "gauge hardware" yellows)
-    ALARM_BATT_COLD,        // P20 BATTCOLD blue
-    ALARM_CRANKING,         // P21 CRANKING green
-    ALARM_AFR_RICH,         // P22 AFR RICH blue
-    ALARM_CLT_COLD,         // P23 CLT COLD blue
-    ALARM_OIL_COLD,         // P24 OIL COLD blue
+    ALARM_OIL_LOW_CRIT = 0, //  1 OIL LOW  red
+    ALARM_CLT_HOT_CRIT,     //  2 CLT HOT  red
+    ALARM_AFR_LEAN_CRIT,    //  3 AFR LEAN red
+    ALARM_OIL_HOT_CRIT,     //  4 OIL HOT  red
+    ALARM_ENGINE_PWR_CRIT,  //  5 PUMP/COIL/MAIN + FLT/OPN red: an engine-class
+                            //    PDM output is faulted, stuck tripped, or open
+    ALARM_PDME_ERR,         //  6 PDME ERR red: PDM-E reports device Error
+    ALARM_PDME_HOT_CRIT,    //  7 PDME HOT red: PDM-E within 5 K of its thermal latch
+    ALARM_VOLT_LOW_CRIT,    //  8 VOLT LOW red
+    ALARM_CELL_LOW_CRIT,    //  9 CELL LOW red
+    ALARM_BATT_HOT_CRIT,    // 10 BATT HOT red
+    ALARM_NO_GAS,           // 11 NO GAS   red
+    ALARM_OIL_LOW_WARN,     // 12 OIL LOW  yellow
+    ALARM_ENGINE_PWR_TRIP,  // 13 PUMP/COIL/MAIN + TRP yellow: an engine-class
+                            //    output tripped (says the stumble was electrical)
+    ALARM_VOLT_LOW_WARN,    // 14 VOLT LOW yellow
+    ALARM_CLT_HOT_WARN,     // 15 CLT HOT  yellow
+    ALARM_OIL_HOT_WARN,     // 16 OIL HOT  yellow
+    ALARM_FAN_FAULT,        // 17 FAN1/FAN2 + TRP/FLT/OPN yellow
+    ALARM_PDM_HOT_WARN,     // 18 PDME HOT / PDML HOT yellow: within 15 K of the latch
+    ALARM_VOLT_HIGH_WARN,   // 19 VLT HIGH yellow
+    ALARM_VISION_FAULT,     // 20 lamp / wiper / defrost tag + TRP/FLT yellow
+    ALARM_PDML_ERR,         // 21 PDML ERR yellow: PDM-L reports device Error
+    ALARM_NO_CAN,           // 22 NO CAN   yellow (ECU link lost)
+    ALARM_PDM_CAN,          // 23 PDME CAN / PDML CAN yellow (PDM status stale)
+    ALARM_AFR_LEAN_WARN,    // 24 AFR LEAN yellow, deferred
+    ALARM_CELL_BAL,         // 25 CELL BAL yellow, deferred
+    ALARM_BATT_HOT_WARN,    // 26 BATT HOT yellow, deferred
+    ALARM_OIL_HIGH_WARN,    // 27 OIL HIGH yellow, deferred
+    ALARM_FUEL_LOW,         // 28 FUEL LOW yellow, deferred
+    ALARM_BODY_FAULT,       // 29 body-class tag + TRP/FLT yellow, deferred
+    ALARM_BATT_CAN,         // 30 BATT CAN yellow, deferred (BMS link lost)
+    ALARM_DIAL_FAIL,        // 31 DIALFAIL yellow, deferred (rotary dial reads open)
+    ALARM_BATT_COLD,        // 32 BATTCOLD blue
+    ALARM_CRANKING,         // 33 CRANKING green
+    ALARM_AFR_RICH,         // 34 AFR RICH blue
+    ALARM_CLT_COLD,         // 35 CLT COLD blue
+    ALARM_OIL_COLD,         // 36 OIL COLD blue
     ALARM_COUNT,
-    ALARM_NONE = 255        // "nothing active" = the plan's NOMINAL, P25
+    ALARM_NONE = 255        // "nothing active" = NOMINAL
     };
 
 // The alarm system's OUTPUT, written by alarmsUpdate() each tick. Consumers
@@ -378,11 +523,15 @@ struct VehicleData
     {
     EcuData    ecu;
     BmsData    bms;
+    PdmData    pdm[PDM_COUNT]; // indexed by PdmId (config.h): PDM_E, PDM_L
     FuelData   fuel;
     SwitchData sw;
+    LampData   lamps;
+    FanData    fans;
     ModeData   mode;
     BoardData  board;
     AlarmsData alarms;
+    PdmEventData pdmEvent;
     FramData   fram;
 
     uint32_t unknownFrameCount; // standard-id CAN frames nothing here expects -
@@ -399,10 +548,18 @@ struct VehicleData
     uint8_t ecuFirstStaleFrame() const; // an EcuFrame, or ECU_F_COUNT if none
     bool bmsFrameFresh(uint8_t frame, uint32_t maxAgeMs) const;
     bool bmsOnline() const;
+
+    // PDM staleness, per row of PDM_FRAMES. PDME CAN / PDML CAN = !pdmOnline().
+    bool pdmFrameFresh(uint8_t pdm, uint8_t row) const; // that status frame is arriving
+    bool pdmFrameSeen(uint8_t pdm, uint8_t row) const;  // ...has arrived at least once
+    bool pdmOnline(uint8_t pdm) const; // every frame the box owes us is fresh
     };
 
 // Short name of an ECU frame for debug prints ("BASE4", "MS-AFRTGT").
 const char* ecuFrameName(uint8_t frame);
+
+// "PDME" / "PDML" - the 4-character box names the banner and prints use.
+const char* pdmName(uint8_t pdm);
 
 // The one and only instance, defined in vehicle_data.cpp. As a global it is
 // zero-initialized before setup() runs - every value starts at a known 0.

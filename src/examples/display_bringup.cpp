@@ -1,13 +1,14 @@
 // ---------------------------------------------------------------------------
 // Rally CAN Gauge - display bring-up test
 // ---------------------------------------------------------------------------
-// First-light sketch for ONE ER-TFT2.79-1 (NV3007) on the Teensy 4.0, using
-// the modified ILI9341_T4 library in lib/ILI9341_T4 (see PORTING_NV3007.md).
+// First-light sketch for ONE ER-TFT2.79-1 (NV3007) on the MicroMod Teensy
+// (the same pins as on the Teensy 4.0 it replaced), using the modified
+// ILI9341_T4 library in lib/ILI9341_T4 (see PORTING_NV3007.md).
 //
-// Wiring (display 1 / "SPI0" from the project plan pinout):
+// Wiring (display 1 / "SPI0" from the pin map in src/config.h):
 //
-//   display pin        Teensy 4.0 pin
-//   -----------        --------------
+//   display pin        Teensy pin
+//   -----------        ----------
 //   1  SDA      ->     11  (SPI0 MOSI)
 //   2  SCL      ->     13  (SPI0 SCK)
 //   3  RS  (DC) ->     10  (hardware CS pin -> big speedup, see library docs)
