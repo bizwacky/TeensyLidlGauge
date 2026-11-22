@@ -10,6 +10,7 @@
 
 #include "config.h"
 
-void modesUpdate(); // call on the 20 ms tick, right after inputsPoll()
+void modesUpdate(); // call on the 20 ms tick, after inputsPoll() and
+                    // pdmUpdate() (night mode reads the lamp states)
 
 const char* modeName(GaugeMode m); // short fixed name, for debug prints

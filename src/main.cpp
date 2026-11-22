@@ -8,14 +8,18 @@
 // The architecture in one picture:
 //
 //    CAN interrupt -> ring buffer -> canBusPoll() ---+
-//    ADC pins  ------> inputsPoll()  (20 ms tick) ---+--> g_data (raw+derived:
-//    RTC + die temp -/                                |    mixture window,
-//                                                     |    fuel calc)
+//    ADC + switch pins -> inputsPoll() (20 ms tick) -+--> g_data (raw+derived:
+//    RTC + die temp -/                                |    PDM verdicts, mixture
+//                                                     |    window, fuel calc)
 //                                                     alarmsUpdate()
 //                                                           v
 //                                                    g_data.alarms --> audio,
 //                                                    (verdicts)     LED tach,
 //                                                                   screens
+//
+// One arrow runs the other way since the roof switch panel moved onto the
+// gauge: its switches and pots go g_data -> canBusTick20ms() -> the PDMs
+// (the car's light switches), and three of the pots -> fansUpdate() -> PWM.
 //
 // Two layers on purpose: input modules establish WHAT IS (temperatures,
 // voltages, freshness), the alarm layer judges WHAT MATTERS (active
@@ -32,9 +36,10 @@
 //
 //   every pass : drain the CAN queue, pump DFPlayer notifications, pump the
 //                FRAM write queue + serial console (all cheap when idle)
-//   20 ms tick : poll inputs, resolve the dial, mixture window, fuel calc,
-//                alarm state machine, LED tach frame, screens 1-3 (draw +
-//                diff + DMA), backlight PWM, feed the watchdog
+//   20 ms tick : poll inputs, PDM verdicts, resolve the dial, mixture window,
+//                fuel calc, fan PWM, alarm state machine, switch/pot frames
+//                to the PDMs, LED tach frame, screens 1-3 (draw + diff +
+//                DMA), backlight PWM, feed the watchdog
 //   1 s tick   : PCS heartbeat, audio arbitration, FRAM fuel record +
 //                black-box log record, debug snapshot
 //
@@ -50,9 +55,11 @@
 #include "vehicle_data.h"
 #include "can_bus.h"
 #include "inputs.h"
+#include "pdm.h"
 #include "modes.h"
 #include "mixture.h"
 #include "fuel_calc.h"
+#include "fans.h"
 #include "alarms.h"
 #include "audio.h"
 #include "led_tach.h"
@@ -134,14 +141,65 @@ static void debugPrint()
                       (unsigned long)(s.rotaryHeldMs() / 1000),
                       f.fillCansAdded, f.fillFullDone);
     Serial.println();
-    Serial.printf("[SW  ] rotary=%u=%s (held %lus, %.0fohm raw=%u%s) head=%d brights=%d blkL=%d blkR=%d\n",
+    // Each PDM: link state, device state, the three device numbers, then one
+    // token per output that is not simply Off - "5:PUMP=On/8A" - with the
+    // verdict appended when pdm.cpp has one ("TRP", "OPN", "FLT") and x3 for
+    // its trip count. "ext=no" = the frames for outputs 9-14 have never
+    // arrived (a stock 8-output board, or a fork that isn't sending them).
+    static const char* devStates[] = { "RUN", "SLEEP", "OVERTEMP", "ERROR" };
+    static const char* outStates[] = { "Off", "On", "OC", "FAULT" };
+    for (uint8_t box = 0; box < PDM_COUNT; box++)
+        {
+        const PdmData& p = g_data.pdm[box];
+        if (p.frameCount == 0)
+            {
+            Serial.printf("[%s] never heard (base id 0x%03lX)\n", pdmName(box),
+                          (unsigned long)PDM_BASE_ID[box]);
+            continue;
+            }
+        bool extSeen = false;
+        for (uint8_t row = 0; row < PDM_FRAME_COUNT; row++)
+            if (PDM_FRAMES[row].need == PDM_NEED_ONCE_SEEN && g_data.pdmFrameSeen(box, row))
+                extSeen = true;
+        Serial.printf("[%s] %s %s %.0fA %.1fV %.1fC ext=%s frames=%lu |",
+                      pdmName(box), g_data.pdmOnline(box) ? "ONLINE " : "STALE  ",
+                      (p.deviceState < 4) ? devStates[p.deviceState] : "?",
+                      p.totalAmps, p.battVolts, p.boardTempC,
+                      extSeen ? "yes" : "no", (unsigned long)p.frameCount);
+        for (uint8_t i = 0; i < PDM_MAX_OUTPUTS; i++)
+            {
+            const PdmOutput& o = p.out[i];
+            if (!o.valid || (o.state == PDM_STATE_OFF && o.verdict == PDM_OUT_OK)) continue;
+            Serial.printf(" %u:%s=%s/%.0fA", i + 1, PDM_OUTPUTS[box][i].tag,
+                          (o.state < 4) ? outStates[o.state] : "?", o.amps);
+            if (o.verdict != PDM_OUT_OK) Serial.printf(" %s", pdmVerdictName(o.verdict));
+            if (o.trips)                 Serial.printf(" x%u", o.trips);
+            }
+        Serial.println();
+        }
+
+    const LampData& l = g_data.lamps;
+    Serial.printf("[SW  ] rotary=%u=%s (held %lus, %.0fohm raw=%u%s) roof=",
                   s.rotaryPos, modeName(g_data.mode.mode),
                   (unsigned long)(s.rotaryHeldMs() / 1000), s.rotaryOhms, s.rotaryRawCounts,
-                  s.rotaryOpen ? " OPEN" : "",
-                  s.headlights, s.brights, s.blinkerL, s.blinkerR);
-    Serial.printf("[MODE] night=%d silent=%d dispOff=%d ledBright=%u scrBright=%u bl=%.0f/%.0f/%.0f%%%s\n",
+                  s.rotaryOpen ? " OPEN" : "");
+    for (uint8_t i = 0; i < ROOF_SWITCH_COUNT; i++)
+        Serial.print(s.roof[i] ? '1' : '0'); // SW1 first
+    Serial.printf(" lamps: head=%d brights=%d turnL=%d turnR=%d\n",
+                  l.headlights, l.brights, l.turnL, l.turnR);
+    // Pots: percent (what the PDMs are sent), ohms and raw counts (what to
+    // calibrate POT_CAL from), '*' when active, OPEN on a broken wire.
+    Serial.printf("[POT ]");
+    for (uint8_t i = 0; i < POT_COUNT; i++)
+        Serial.printf(" %u=%.0f%%%s(%.0fohm raw=%u%s)", i + 1, s.pot[i].pct,
+                      s.pot[i].active ? "*" : "", s.pot[i].ohms, s.pot[i].rawCounts,
+                      s.pot[i].open ? " OPEN" : "");
+    Serial.printf(" | fan duty %u/%u/%u%%\n", g_data.fans.dutyPct[0],
+                  g_data.fans.dutyPct[1], g_data.fans.dutyPct[2]);
+    Serial.printf("[MODE] night=%d silent=%d dispOff=%d ledBright=%u labelBright=%u scrBright=%u bl=%.0f/%.0f/%.0f%%%s\n",
                   g_data.mode.night, g_data.mode.silent, g_data.mode.displaysOff,
-                  g_data.mode.ledBrightness, g_data.mode.screenBrightness,
+                  g_data.mode.ledBrightness, g_data.mode.labelBrightness,
+                  g_data.mode.screenBrightness,
                   backlightDutyPct(0), backlightDutyPct(1), backlightDutyPct(2),
                   backlightPhaseLocked() ? "" : " (BL NOT PHASE-LOCKED)");
     Serial.printf("[BRD ] cpu=%.1fC clock=", b.cpuTempC);
@@ -194,7 +252,9 @@ void setup()
     Serial.println("\n=== Rally CAN Gauge ===");
     watchdogPrintResetCause(); // first thing: did we get here via a crash?
     inputsInit();
+    fansInit();    // park the fan PWM pins early: until then they float
     canBusInit();
+    pdmInit();
     framInit();    // bring up the I2C bus, probe the chip
     framLogInit(); // verify/format the layout, recover the log head
     fuelCalcInit();// restores the FRAM fuel record - must follow framLogInit
@@ -232,11 +292,14 @@ void loop()
         sinceFast -= TICK_FAST_MS;
         if (sinceFast >= TICK_FAST_MS) sinceFast = 0; // fell behind: skip, don't burst
 
-        inputsPoll();     // fuel, rotary, switches, temp, clock -> g_data
-        modesUpdate();    // dial position -> resolved mode flags (g_data.mode)
+        inputsPoll();     // fuel, rotary, roof switches, pots, temp, clock -> g_data
+        pdmUpdate();      // PDM status -> per-output verdicts + lamp states
+        modesUpdate();    // dial position (+ lamps) -> resolved mode flags (g_data.mode)
         mixtureUpdate();  // gated two-second lambda window -> g_data.ecu
         fuelCalcUpdate(); // burn integration + FUEL FILL gesture -> g_data.fuel
+        fansUpdate();     // pots -> cabin fan PWM duty
         alarmsUpdate();   // evaluate the whole warning catalog -> g_data.alarms
+        canBusTick20ms(); // roof switches + pots -> the PDMs (on change / 10 Hz)
         ledTachUpdate();  // paint the strip from this tick's verdicts (50 Hz)
         screensUpdate();  // compose + diff + DMA-push all three panels
         backlightUpdate();// fade screen backlights toward the mode's level

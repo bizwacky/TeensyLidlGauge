@@ -10,10 +10,18 @@
 // Design: table-driven. Adding an alarm = one enum entry (vehicle_data.h,
 // in priority position), one condition function, one table row. The state
 // machine, display and audio code never change.
+//
+// The catalogue's shape (36 rows) comes from the Nov 2026 alarm structure:
+// red = act now and it changes the outcome; yellow "live" = change how you
+// drive or what is switched on; yellow "deferred" = nothing to do until the
+// car stops; blue = information. The PDM rows class a fault by what it
+// costs, not by which of 28 channels it is on: four load classes, and the
+// banner names the load ("PUMP FLT", "FAN1 OPN", "LOBM TRP").
 // ---------------------------------------------------------------------------
 
 #include "alarms.h"
 #include "config.h"
+#include "pdm.h"
 
 // --- 1. helpers -----------------------------------------------------------------
 
@@ -147,16 +155,46 @@ static bool condAfrRich(bool on)
 
 // Voltage alarms watch the alternator, so they only mean something with the
 // engine turning (a resting pack sits below 14.0 V by design).
+//
+// They have a second trigger since Nov 2026: the pack DISCHARGING with the
+// engine above idle. The LTO pack is stiff - with the alternator dead it
+// holds the bus above 13.2 V for a good while - so the voltage rule alone
+// speaks up late. Current leaving the pack at speed says "you are on the
+// battery" within seconds. The persistence lives here (not in the table's
+// setMs, which both VOLT LOW rows also need for their voltage rule), and
+// is evaluated once per tick in alarmsUpdate() because two rows read it.
+static bool s_packDischarging;
+
+static void updatePackDischarging(uint32_t now)
+    {
+    static uint32_t s_sinceMs = 0; // 0 = not currently discharging
+
+    const bool raw = g_data.bmsFrameFresh(BMS_F_PACK, BMS_OFFLINE_MS)
+                  && g_data.ecuOnline()
+                  && g_data.ecu.rpm >= VOLT_DISCHARGE_MIN_RPM
+                  && g_data.bms.packAmps > VOLT_DISCHARGE_AMPS;
+    if (!raw)
+        {
+        s_sinceMs = 0;
+        s_packDischarging = false;
+        return;
+        }
+    if (s_sinceMs == 0) s_sinceMs = now ? now : 1;
+    s_packDischarging = (now - s_sinceMs) >= VOLT_DISCHARGE_MS;
+    }
+
 static bool condVoltLowCrit(bool on)
     {
-    return voltDataOk() && engineRunning()
-        && below(g_data.ecu.battVolts, VOLT_LOW_CRIT_V, VOLT_HYST_V, on);
+    return s_packDischarging
+        || (voltDataOk() && engineRunning()
+            && below(g_data.ecu.battVolts, VOLT_LOW_CRIT_V, VOLT_HYST_V, on));
     }
 
 static bool condVoltLowWarn(bool on)
     {
-    return voltDataOk() && engineRunning()
-        && below(g_data.ecu.battVolts, VOLT_LOW_WARN_V, VOLT_HYST_V, on);
+    return s_packDischarging
+        || (voltDataOk() && engineRunning()
+            && below(g_data.ecu.battVolts, VOLT_LOW_WARN_V, VOLT_HYST_V, on));
     }
 
 static bool condVoltHighWarn(bool on)
@@ -255,56 +293,204 @@ static bool condCranking(bool)
         && g_data.ecu.rpm > 0 && g_data.ecu.rpm <= ENGINE_RUNNING_RPM;
     }
 
+// --- the PDM rows --------------------------------------------------------------------
+// These rows have no fixed text: the banner says WHICH load and WHAT is
+// wrong with it. Each condition below, when it finds something, writes the
+// 8 characters into its row's slot of s_dynName; alarmName() hands that
+// out instead of the table's placeholder. A condition that finds nothing
+// leaves the text alone, so the banner keeps naming the culprit for the
+// row's clear time after the fault is gone.
+//
+// All the judging - what counts as a trip, how long "stuck" is, when a
+// load is open - already happened in pdm.cpp, which also drops every
+// verdict to OK while a box's data is stale. So these stay one-liners and
+// the validity gate is built in.
+
+static char s_dynName[ALARM_COUNT][9];
+static bool s_engineTripIsPump; // picks ENGINE_PWR_TRIP's voice clip
+
+// "PUMP FLT": 4-character load tag, a space, the 3-character verdict.
+static void nameLoad(uint8_t id, uint8_t box, uint8_t output, PdmVerdict v)
+    {
+    snprintf(s_dynName[id], sizeof(s_dynName[id]), "%-4.4s %-3.3s",
+             PDM_OUTPUTS[box][output].tag, pdmVerdictName(v));
+    }
+
+// "PDML HOT": the box's 4-character name, a space, a 3-character word.
+static void nameBox(uint8_t id, uint8_t box, const char* word)
+    {
+    snprintf(s_dynName[id], sizeof(s_dynName[id]), "%-4.4s %-3.3s", pdmName(box), word);
+    }
+
+// The four load-class rows share one shape: "is any output of this class in
+// this range of verdicts - and if so, name the worst".
+static bool condLoadClass(uint8_t id, LoadClass cls, PdmVerdict lo, PdmVerdict hi)
+    {
+    uint8_t    box = 0, output = 0;
+    PdmVerdict v = PDM_OUT_OK;
+    if (!pdmFindVerdict(cls, lo, hi, box, output, v))
+        return false;
+    nameLoad(id, box, output, v);
+    if (id == ALARM_ENGINE_PWR_TRIP)
+        s_engineTripIsPump = (strncmp(PDM_OUTPUTS[box][output].tag, "PUMP", 4) == 0);
+    return true;
+    }
+
+// Red: an engine-class output is gone (FLT) or feeding nothing (OPN). A
+// trip that recovers is NOT red - losing the output for two seconds is, and
+// pdm.cpp's "stuck" rule turns that into FLT.
+static bool condEnginePwrCrit(bool)
+    {
+    return condLoadClass(ALARM_ENGINE_PWR_CRIT, LOAD_ENGINE, PDM_OUT_OPN, PDM_OUT_FLT);
+    }
+
+// Yellow: an engine-class output tripped and came back. Nothing to do about
+// it at speed - but it tells the crew the stumble they just felt was
+// electrical, which is worth knowing before the next one.
+static bool condEnginePwrTrip(bool)
+    {
+    return condLoadClass(ALARM_ENGINE_PWR_TRIP, LOAD_ENGINE, PDM_OUT_TRP, PDM_OUT_TRP);
+    }
+
+static bool condFanFault(bool)
+    {
+    return condLoadClass(ALARM_FAN_FAULT, LOAD_COOLING, PDM_OUT_TRP, PDM_OUT_FLT);
+    }
+
+static bool condVisionFault(bool)
+    {
+    return condLoadClass(ALARM_VISION_FAULT, LOAD_VISION, PDM_OUT_TRP, PDM_OUT_FLT);
+    }
+
+static bool condBodyFault(bool)
+    {
+    return condLoadClass(ALARM_BODY_FAULT, LOAD_BODY, PDM_OUT_TRP, PDM_OUT_FLT);
+    }
+
+// Device-level rows. PDM-E can stop the car, so its Error and its last 5 K
+// before the thermal latch are red; PDM-L cannot (forward lighting is split
+// across both boxes), so the same conditions on it are yellow.
+static bool condPdmeErr(bool)
+    {
+    return pdmDeviceFresh(PDM_E) && g_data.pdm[PDM_E].deviceState == PDM_DEV_ERROR;
+    }
+
+static bool condPdmlErr(bool)
+    {
+    return pdmDeviceFresh(PDM_L) && g_data.pdm[PDM_L].deviceState == PDM_DEV_ERROR;
+    }
+
+static bool pdmHotter(uint8_t box, float marginC, bool on)
+    {
+    return pdmDeviceFresh(box)
+        && above(g_data.pdm[box].boardTempC, PDM_LATCH_TEMP_C - marginC, PDM_TEMP_HYST_C, on);
+    }
+
+static bool condPdmeHotCrit(bool on)
+    {
+    return pdmHotter(PDM_E, PDM_HOT_CRIT_MARGIN_C, on);
+    }
+
+// Either box within 15 K of its latch: shed load. (PDM-L's own 5 K point
+// stays yellow, so it needs no second row - it is inside this one.)
+static bool condPdmHotWarn(bool on)
+    {
+    for (uint8_t box = 0; box < PDM_COUNT; box++) // PDM-E first: it names the banner
+        if (pdmHotter(box, PDM_HOT_WARN_MARGIN_C, on))
+            {
+            nameBox(ALARM_PDM_HOT_WARN, box, "HOT");
+            return true;
+            }
+    return false;
+    }
+
+// A box has gone quiet. Like NO CAN, the banner is the only thing a stale
+// box produces: every verdict from it is already OK.
+static bool condPdmCan(bool)
+    {
+    for (uint8_t box = 0; box < PDM_COUNT; box++)
+        if (!g_data.pdmOnline(box))
+            {
+            nameBox(ALARM_PDM_CAN, box, "CAN");
+            return true;
+            }
+    return false;
+    }
+
 // --- 3. THE TABLE -------------------------------------------------------------------
-// Order MUST match enum AlarmId in vehicle_data.h (= the plan's priority
-// order). setMs/clearMs choices in words: oil pressure trips fast (200 ms)
+// Order MUST match enum AlarmId in vehicle_data.h (= the catalogue's
+// priority order; a row's catalogue number is its index + 1).
+// setMs/clearMs choices in words: oil pressure trips fast (200 ms)
 // because at 7000 rpm every second without oil matters; temperatures move
 // slowly so 2 s filters sensor noise for free; voltage waits 3 s so a big
 // load dip at idle doesn't cry alternator; fuel waits 5 s on top of the
 // already-slosh-filtered level; the CAN link alarms wait a few seconds so
 // a normal ECU boot-up doesn't flash NO CAN at every ignition-on.
+// The PDM load rows carry almost no persistence of their own: pdm.cpp
+// already built it into the verdicts (a TRP is held 10 s, FLT-by-stuck
+// took 2 s to earn, OPN took 1-2 s). 200 ms = two status frames, enough
+// to shrug off one corrupt nibble. TRP rows set at once - the verdict is
+// already an event that happened.
+//
+// "tier" is the catalogue's live/deferred column. NOTHING READS IT YET: it
+// is carried so the pace gate (hide deferred rows at stage pace), deferred
+// on 21 Nov 2026, is a small change when it is wanted.
+//
+// Names in parentheses are placeholders for rows whose text is written at
+// run time (the PDM rows above).
 
 struct AlarmDef
     {
-    const char* name;       // 8 chars, exactly as in the plan
+    const char* name;       // 8 chars, exactly as on the banner
     AlarmColor  color;
-    uint8_t     priority;   // the plan's number (info only - order arbitrates)
+    AlarmTier   tier;       // see the note above - not consumed yet
     uint16_t    setMs;      // condition true this long -> active
     uint16_t    clearMs;    // condition false this long -> inactive
     AudioClip   clip;       // CLIP_NONE = silent
     uint32_t    repeatMs;   // 0 = say once per activation; else GPWS-repeat
     bool      (*cond)(bool currentlyActive);
+    bool        dynamic;    // text comes from s_dynName, not 'name'
     };
 
 static const AlarmDef k_defs[ALARM_COUNT] =
     {
-    //  name        color         pri  set    clear  clip                repeat  condition
-    { "OIL LOW ", ALARM_RED,     1,   200,  1000, CLIP_OIL_PRESSURE, 10000, condOilLowCrit  },
-    { "CLT HOT ", ALARM_RED,     2,  2000,  3000, CLIP_WATER_TEMP,   10000, condCltHotCrit  },
-    { "AFR LEAN", ALARM_RED,     3,   500,  2000, CLIP_AFR_LEAN,     10000, condAfrLeanCrit },
-    { "OIL HOT ", ALARM_RED,     4,  2000,  3000, CLIP_OIL_TEMP,     10000, condOilHotCrit  },
-    { "VOLT LOW", ALARM_RED,     5,  3000,  3000, CLIP_ALTERNATOR,   15000, condVoltLowCrit },
-    { "CELL LOW", ALARM_RED,     6,  2000,  3000, CLIP_CELL_LOW,     15000, condCellLowCrit },
-    { "BATT HOT", ALARM_RED,     7,  2000,  3000, CLIP_BATT_TEMP,    15000, condBattHotCrit },
-    { "NO GAS  ", ALARM_RED,     8,  5000,  5000, CLIP_NO_GAS,       30000, condNoGas       },
-    { "OIL LOW ", ALARM_YELLOW,  9,   500,  1000, CLIP_NONE,             0, condOilLowWarn  },
-    { "VOLT LOW", ALARM_YELLOW, 10,  3000,  3000, CLIP_ALTERNATOR,       0, condVoltLowWarn },
-    { "CLT HOT ", ALARM_YELLOW, 11,  2000,  3000, CLIP_NONE,             0, condCltHotWarn  },
-    { "OIL HOT ", ALARM_YELLOW, 12,  2000,  3000, CLIP_NONE,             0, condOilHotWarn  },
-    { "AFR LEAN", ALARM_YELLOW, 13,   500,  2000, CLIP_NONE,             0, condAfrLeanWarn },
-    { "CELL BAL", ALARM_YELLOW, 13,  3000,  3000, CLIP_CELL_BAL,         0, condCellBal     },
-    { "BATT HOT", ALARM_YELLOW, 14,  2000,  3000, CLIP_BATT_TEMP,        0, condBattHotWarn },
-    { "VLT HIGH", ALARM_YELLOW, 15,  1000,  2000, CLIP_OVERVOLT,         0, condVoltHighWarn},
-    { "OIL HIGH", ALARM_YELLOW, 16,  1000,  2000, CLIP_NONE,             0, condOilHighWarn },
-    { "FUEL LOW", ALARM_YELLOW, 17,  5000,  5000, CLIP_FUEL_LOW,         0, condFuelLow     },
-    { "BATT CAN", ALARM_YELLOW, 18,  2000,  2000, CLIP_BATT_CAN,         0, condBattCan     },
-    { "NO CAN  ", ALARM_YELLOW, 19,  3000,  2000, CLIP_NO_CAN,           0, condNoCan       },
-    { "DIALFAIL", ALARM_YELLOW, 20, ROTARY_OPEN_MS, 2000, CLIP_DIAL_FAIL,  0, condDialFail    },
-    { "BATTCOLD", ALARM_BLUE,   20,  5000,  5000, CLIP_NONE,             0, condBattCold    },
-    { "CRANKING", ALARM_GREEN,  21,   300,   300, CLIP_NONE,             0, condCranking    },
-    { "AFR RICH", ALARM_BLUE,   22,  1000,  2000, CLIP_NONE,             0, condAfrRich     },
-    { "CLT COLD", ALARM_BLUE,   23,  2000,  3000, CLIP_NONE,             0, condCltCold     },
-    { "OIL COLD", ALARM_BLUE,   24,  2000,  3000, CLIP_NONE,             0, condOilCold     },
+    //  name        color         tier           set    clear  clip                repeat  condition         dynamic
+    { "OIL LOW ", ALARM_RED,    TIER_LIVE,      200,  1000, CLIP_OIL_PRESSURE, 10000, condOilLowCrit,    false }, //  1
+    { "CLT HOT ", ALARM_RED,    TIER_LIVE,     2000,  3000, CLIP_WATER_TEMP,   10000, condCltHotCrit,    false }, //  2
+    { "AFR LEAN", ALARM_RED,    TIER_LIVE,      500,  2000, CLIP_AFR_LEAN,     10000, condAfrLeanCrit,   false }, //  3
+    { "OIL HOT ", ALARM_RED,    TIER_LIVE,     2000,  3000, CLIP_OIL_TEMP,     10000, condOilHotCrit,    false }, //  4
+    { "(ENGINE)", ALARM_RED,    TIER_LIVE,      200,  2000, CLIP_ENGINE_POWER, 10000, condEnginePwrCrit, true  }, //  5
+    { "PDME ERR", ALARM_RED,    TIER_LIVE,      500,  2000, CLIP_PDM_FAULT,    15000, condPdmeErr,       false }, //  6
+    { "PDME HOT", ALARM_RED,    TIER_LIVE,     2000,  3000, CLIP_PDM_TEMP,     15000, condPdmeHotCrit,   false }, //  7
+    { "VOLT LOW", ALARM_RED,    TIER_LIVE,     3000,  3000, CLIP_ALTERNATOR,   15000, condVoltLowCrit,   false }, //  8
+    { "CELL LOW", ALARM_RED,    TIER_LIVE,     2000,  3000, CLIP_CELL_LOW,     15000, condCellLowCrit,   false }, //  9
+    { "BATT HOT", ALARM_RED,    TIER_LIVE,     2000,  3000, CLIP_BATT_TEMP,    15000, condBattHotCrit,   false }, // 10
+    { "NO GAS  ", ALARM_RED,    TIER_LIVE,     5000,  5000, CLIP_NO_GAS,       30000, condNoGas,         false }, // 11
+    { "OIL LOW ", ALARM_YELLOW, TIER_LIVE,      500,  1000, CLIP_NONE,             0, condOilLowWarn,    false }, // 12
+    { "(ENGINE)", ALARM_YELLOW, TIER_LIVE,        0,   500, CLIP_PUMP_TRIP,        0, condEnginePwrTrip, true  }, // 13
+    { "VOLT LOW", ALARM_YELLOW, TIER_LIVE,     3000,  3000, CLIP_ALTERNATOR,       0, condVoltLowWarn,   false }, // 14
+    { "CLT HOT ", ALARM_YELLOW, TIER_LIVE,     2000,  3000, CLIP_NONE,             0, condCltHotWarn,    false }, // 15
+    { "OIL HOT ", ALARM_YELLOW, TIER_LIVE,     2000,  3000, CLIP_NONE,             0, condOilHotWarn,    false }, // 16
+    { "(FAN)   ", ALARM_YELLOW, TIER_LIVE,      200,  1000, CLIP_FAN_FAULT,        0, condFanFault,      true  }, // 17
+    { "(PDM)HOT", ALARM_YELLOW, TIER_LIVE,     2000,  3000, CLIP_PDM_TEMP,         0, condPdmHotWarn,    true  }, // 18
+    { "VLT HIGH", ALARM_YELLOW, TIER_LIVE,     1000,  2000, CLIP_OVERVOLT,         0, condVoltHighWarn,  false }, // 19
+    { "(VISION)", ALARM_YELLOW, TIER_LIVE,      200,  1000, CLIP_LIGHT_FAULT,      0, condVisionFault,   true  }, // 20
+    { "PDML ERR", ALARM_YELLOW, TIER_LIVE,      500,  2000, CLIP_PDM_FAULT,        0, condPdmlErr,       false }, // 21
+    { "NO CAN  ", ALARM_YELLOW, TIER_LIVE,     3000,  2000, CLIP_NO_CAN,           0, condNoCan,         false }, // 22
+    { "(PDM)CAN", ALARM_YELLOW, TIER_LIVE,     1000,  2000, CLIP_PDM_LINK,         0, condPdmCan,        true  }, // 23
+    { "AFR LEAN", ALARM_YELLOW, TIER_DEFERRED,  500,  2000, CLIP_NONE,             0, condAfrLeanWarn,   false }, // 24
+    { "CELL BAL", ALARM_YELLOW, TIER_DEFERRED, 3000,  3000, CLIP_CELL_BAL,         0, condCellBal,       false }, // 25
+    { "BATT HOT", ALARM_YELLOW, TIER_DEFERRED, 2000,  3000, CLIP_BATT_TEMP,        0, condBattHotWarn,   false }, // 26
+    { "OIL HIGH", ALARM_YELLOW, TIER_DEFERRED, 1000,  2000, CLIP_NONE,             0, condOilHighWarn,   false }, // 27
+    { "FUEL LOW", ALARM_YELLOW, TIER_DEFERRED, 5000,  5000, CLIP_FUEL_LOW,         0, condFuelLow,       false }, // 28
+    { "(BODY)  ", ALARM_YELLOW, TIER_DEFERRED,  200,  1000, CLIP_CHECK_MSG,        0, condBodyFault,     true  }, // 29
+    { "BATT CAN", ALARM_YELLOW, TIER_DEFERRED, 2000,  2000, CLIP_BATT_CAN,         0, condBattCan,       false }, // 30
+    { "DIALFAIL", ALARM_YELLOW, TIER_DEFERRED, ROTARY_OPEN_MS, 2000, CLIP_DIAL_FAIL, 0, condDialFail,    false }, // 31
+    { "BATTCOLD", ALARM_BLUE,   TIER_DEFERRED, 5000,  5000, CLIP_NONE,             0, condBattCold,      false }, // 32
+    { "CRANKING", ALARM_GREEN,  TIER_DEFERRED,  300,   300, CLIP_NONE,             0, condCranking,      false }, // 33
+    { "AFR RICH", ALARM_BLUE,   TIER_DEFERRED, 1000,  2000, CLIP_NONE,             0, condAfrRich,       false }, // 34
+    { "CLT COLD", ALARM_BLUE,   TIER_DEFERRED, 2000,  3000, CLIP_NONE,             0, condCltCold,       false }, // 35
+    { "OIL COLD", ALARM_BLUE,   TIER_DEFERRED, 2000,  3000, CLIP_NONE,             0, condOilCold,       false }, // 36
     };
 
 // --- 4. the state machine --------------------------------------------------------
@@ -316,6 +502,11 @@ static uint32_t s_falseSinceMs[ALARM_COUNT];
 
 void alarmsInit()
     {
+    // Until a dynamic row's condition has named something, its slot shows
+    // the table's placeholder rather than an empty string.
+    for (uint8_t i = 0; i < ALARM_COUNT; i++)
+        strlcpy(s_dynName[i], k_defs[i].name, sizeof(s_dynName[i]));
+
     Serial.printf("Alarms: %u definitions loaded\n", (unsigned)ALARM_COUNT);
     }
 
@@ -323,6 +514,8 @@ void alarmsUpdate()
     {
     const uint32_t now = millis();
     AlarmsData& a = g_data.alarms;
+
+    updatePackDischarging(now); // shared by both VOLT LOW rows - once per tick
 
     a.top = ALARM_NONE;
     a.anyRed = false;
@@ -363,7 +556,8 @@ void alarmsUpdate()
 
 const char* alarmName(uint8_t id)
     {
-    return (id < ALARM_COUNT) ? k_defs[id].name : "NOMINAL ";
+    if (id >= ALARM_COUNT) return "NOMINAL ";
+    return k_defs[id].dynamic ? s_dynName[id] : k_defs[id].name;
     }
 
 AlarmColor alarmColor(uint8_t id)
@@ -371,14 +565,26 @@ AlarmColor alarmColor(uint8_t id)
     return (id < ALARM_COUNT) ? k_defs[id].color : ALARM_GREEN;
     }
 
+AlarmTier alarmTier(uint8_t id)
+    {
+    return (id < ALARM_COUNT) ? k_defs[id].tier : TIER_DEFERRED;
+    }
+
 uint8_t alarmPriority(uint8_t id)
     {
-    return (id < ALARM_COUNT) ? k_defs[id].priority : 25; // 25 = the plan's Nominal
+    // The enum IS the priority order, so a row's catalogue number is its
+    // index + 1. Nominal sorts after everything.
+    return (id < ALARM_COUNT) ? (uint8_t)(id + 1) : (uint8_t)(ALARM_COUNT + 1);
     }
 
 AudioClip alarmClip(uint8_t id)
     {
-    return (id < ALARM_COUNT) ? k_defs[id].clip : CLIP_NONE;
+    if (id >= ALARM_COUNT) return CLIP_NONE;
+    // One row, two voices: a tripping PUMP gets its own callout, a tripping
+    // coil or main feed the general one.
+    if (id == ALARM_ENGINE_PWR_TRIP && !s_engineTripIsPump)
+        return CLIP_ENGINE_POWER;
+    return k_defs[id].clip;
     }
 
 uint32_t alarmRepeatMs(uint8_t id)

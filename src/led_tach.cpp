@@ -1,8 +1,8 @@
 // ---------------------------------------------------------------------------
 // Rally CAN Gauge - the WS2812B LED strip (status block + tach + shift light)
 // ---------------------------------------------------------------------------
-// Every 20 ms this module composes one complete 15-LED frame from scratch in
-// a local buffer and hands it to WS2812Serial. "Compose then show" - never
+// Every 20 ms this module composes one complete frame from scratch (the 15
+// tach LEDs, then the label backlights) and hands it to WS2812Serial. "Compose then show" - never
 // mutate individual LEDs across ticks - means there is no stale-pixel state
 // to get wrong: whatever g_data says right now IS what the strip shows,
 // exactly like the screens will re-render from g_data each frame.
@@ -27,7 +27,16 @@
 //
 // Timing check: 15 LEDs x 30 us + 300 us reset latch = ~0.75 ms on the wire,
 // far shorter than the 20 ms between frames, so a show() never has to wait
-// for the previous transfer.
+// for the previous transfer. Each label backlight adds 30 us; even fifty of
+// them keep the frame under 2.3 ms.
+//
+// THE LABEL BACKLIGHTS ride on the same data chain, after the 15 tach LEDs
+// (config.h, LED_BACKLIGHT_COUNT). A WS2812 chain is all-or-nothing - every
+// show() clocks out every LED - so they are re-sent with each tach frame,
+// but they are painted by their own function (paintBacklights) and by
+// nothing else: the ladder below only ever addresses the first 15 LEDs.
+// That separation is the feature. A label must stay lit and steady while
+// the tach beside it flashes red.
 // ---------------------------------------------------------------------------
 
 #include <Arduino.h>
@@ -44,10 +53,10 @@
 // bit, hence 12 bytes per LED). DMAMEM places the streamed buffer in OCRAM,
 // the region the DMA controller reads without competing with code fetches.
 
-static byte        s_drawingMemory[LED_COUNT * 3];
-DMAMEM static byte s_displayMemory[LED_COUNT * 12];
+static byte        s_drawingMemory[LED_TOTAL_COUNT * 3];
+DMAMEM static byte s_displayMemory[LED_TOTAL_COUNT * 12];
 
-static WS2812Serial s_strip(LED_COUNT, s_displayMemory, s_drawingMemory,
+static WS2812Serial s_strip(LED_TOTAL_COUNT, s_displayMemory, s_drawingMemory,
                             PIN_LED_STRIP, WS2812_GRB);
 
 // Brightness for the frame being composed (set once per tick from the
@@ -67,13 +76,38 @@ static uint32_t scaleColor(uint32_t c, uint8_t b)
     return (r << 16) | (g << 8) | bl;
     }
 
-// The ONLY writer to the strip buffer: applies brightness and the
+// The ONLY writer to the tach strip's 15 pixels: applies brightness and the
 // mirror-if-reversed mapping in one place. "logical" 0 is always the left
 // end of the status block regardless of which way the strip is wired.
 static void setLed(uint8_t logical, uint32_t color)
     {
     const uint8_t physical = LED_STRIP_REVERSED ? (LED_COUNT - 1 - logical) : logical;
     s_strip.setPixel(physical, scaleColor(color, s_brightness));
+    }
+
+// The ONLY writer to the label backlights (chain positions LED_COUNT and
+// up - never mirrored: they hang off the end of the chain whichever way
+// round the tach strip is mounted). One color for all of them: white by
+// day, the night orange after dark, at the level modes.cpp resolved from
+// the dial. Displays Off darkens them with everything else.
+static void paintBacklights()
+    {
+    const ModeData& m = g_data.mode;
+    const uint32_t  c = m.displaysOff
+                            ? 0
+                            : scaleColor(m.night ? LED_COLOR_BACKLIGHT_NIGHT
+                                                 : LED_COLOR_BACKLIGHT_DAY,
+                                         m.labelBrightness);
+    for (uint8_t i = 0; i < LED_BACKLIGHT_COUNT; i++)
+        s_strip.setPixel(LED_COUNT + i, c);
+    }
+
+// Every frame leaves through here, so no branch of the ladder can forget
+// the backlights.
+static void showFrame()
+    {
+    paintBacklights();
+    s_strip.show();
     }
 
 // Square-wave flash phase from the shared millis() clock. Using wall time
@@ -120,10 +154,14 @@ void ledTachInit()
     s_strip.begin();
 
     // Paint a black frame immediately: WS2812s power up in random states,
-    // and a strip of random colors during boot looks like a fault.
-    for (uint8_t i = 0; i < LED_COUNT; i++)
+    // and a strip of random colors during boot looks like a fault. That
+    // goes for the label backlights too; the first tick lights them.
+    for (uint8_t i = 0; i < LED_TOTAL_COUNT; i++)
         s_strip.setPixel(i, 0);
     s_strip.show();
+
+    Serial.printf("LEDs: %u tach + %u label backlights on pin %u\n",
+                  (unsigned)LED_COUNT, (unsigned)LED_BACKLIGHT_COUNT, PIN_LED_STRIP);
     }
 
 void ledTachUpdate()
@@ -138,7 +176,7 @@ void ledTachUpdate()
         {
         for (uint8_t i = 0; i < LED_COUNT; i++)
             s_strip.setPixel(i, 0);
-        s_strip.show();
+        showFrame(); // paintBacklights() darkens the labels in this mode too
         return;
         }
 
@@ -155,13 +193,14 @@ void ledTachUpdate()
 
     // --- priority 1: red alarm -> the whole gauge flashes red ------------------
     // Silent mode opts out (plan: "disables flashing") and is handled as a
-    // solid red status block below, leaving the tach usable.
+    // solid red status block below, leaving the tach usable. "Whole gauge"
+    // is the 15 tach LEDs - the label backlights keep their steady color.
     if (a.anyRed && !silent)
         {
         const uint32_t c = flashOn(LED_RED_FLASH_HALF_MS) ? LED_COLOR_ALERT_RED : 0;
         for (uint8_t i = 0; i < LED_COUNT; i++)
             setLed(i, c);
-        s_strip.show();
+        showFrame();
         return;
         }
 
@@ -218,5 +257,5 @@ void ledTachUpdate()
             }
         }
 
-    s_strip.show();
+    showFrame();
     }

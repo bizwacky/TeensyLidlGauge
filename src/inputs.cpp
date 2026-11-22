@@ -6,6 +6,7 @@
 #include "config.h"
 #include "vehicle_data.h"
 
+#include <math.h>
 #include <TimeLib.h> // Teensy Time library; RTC survives power-off via coin cell
 
 // The Teensy 4 die-temperature monitor, provided by the core.
@@ -149,10 +150,11 @@ static void readRotary()
     const int raw = analogRead(PIN_ROTARY);
     sw.rotaryRawCounts = (uint16_t)raw;
 
-    // counts -> ohms (ratiometric, like the fuel sender), then the nearest
-    // tap of the 220R ladder. The voltage steps are uneven (the pull-up
-    // makes it a curve) but the RESISTANCE steps are equal, so rounding in
-    // ohms puts every decision boundary halfway between taps.
+    // counts -> ohms (ratiometric, like the fuel sender). The ohms figure is
+    // for the open-circuit test and the debug print; the POSITION is decided
+    // on the divider ratio itself, because the ladder's resistors were
+    // picked for even VOLTAGE steps (config.h draws it): the nearest
+    // expected ratio wins, so every boundary sits halfway between taps.
     const float ohms = dividerOhms(raw, ROTARY_PULLUP_OHMS);
     sw.rotaryOhms = ohms;
 
@@ -167,8 +169,16 @@ static void readRotary()
         }
     else
         {
-        const int pos = (int)(ohms / ROTARY_STEP_OHMS + 0.5f); // round to nearest tap
-        candidate = (uint8_t)constrain(pos, 0, ROTARY_POSITIONS - 1);
+        const float f = raw / (float)ADC_MAX_COUNTS;
+        uint8_t best     = 0;
+        float   bestDist = 2.0f; // any real distance is below 1
+        for (uint8_t k = 0; k < ROTARY_POSITIONS; k++)
+            {
+            const float expected = ROTARY_OHMS[k] / (ROTARY_OHMS[k] + ROTARY_PULLUP_OHMS);
+            const float dist     = fabsf(f - expected);
+            if (dist < bestDist) { bestDist = dist; best = k; }
+            }
+        candidate = best;
         }
 
     // Debounce: only accept a candidate after it has read the same for
@@ -224,25 +234,124 @@ static void readRotary()
         }
     }
 
-// --- 12V switch inputs -------------------------------------------------------------
+// --- roof switch panel: six ground-switched inputs ---------------------------------
+// Plain digital reads (the pads' Schmitt triggers are switched on in
+// inputsInit - config.h explains why they must be), then the same
+// "stable for N ticks" debounce the dial uses. A switch contact bounces for
+// a few milliseconds; the 100n on the input already swallows most of that,
+// and three matching 20 ms samples swallow the rest.
 
-// Threshold with hysteresis: above ON -> true, below OFF -> false, in the
-// dead band between them -> keep the previous state. This is what stops a
-// slowly-rising or noisy input from rattling the state on and off.
-static bool readSwitch12V(uint8_t pin, bool current)
+static void readRoofSwitches()
     {
-    const int raw = analogRead(pin);
-    if (raw >= SWITCH_ON_COUNTS)  return true;
-    if (raw <= SWITCH_OFF_COUNTS) return false;
-    return current;
+    static uint8_t s_candidate[ROOF_SWITCH_COUNT];
+    static uint8_t s_stable[ROOF_SWITCH_COUNT];
+
+    SwitchData& sw = g_data.sw;
+    uint8_t bits = 0;
+
+    for (uint8_t i = 0; i < ROOF_SWITCH_COUNT; i++)
+        {
+        // LOW = the switch has closed its wire to ground
+        const bool closed = (digitalReadFast(PIN_ROOF_SWITCH[i]) == LOW);
+        const uint8_t on  = (closed == ROOF_SWITCH_ON_WHEN_CLOSED[i]) ? 1 : 0;
+
+        if (on == s_candidate[i])
+            {
+            if (s_stable[i] < 255) s_stable[i]++;
+            }
+        else
+            {
+            s_candidate[i] = on;
+            s_stable[i]    = 1;
+            }
+        if (s_stable[i] >= ROOF_SWITCH_DEBOUNCE_TICKS)
+            sw.roof[i] = (on != 0);
+
+        if (sw.roof[i]) bits |= (uint8_t)(1u << i);
+        }
+    sw.roofBits = bits;
     }
 
-static void readSwitches()
+// --- roof switch panel: five pots ---------------------------------------------------
+// counts -> ohms -> percent of travel, the fuel sender's recipe with a pot
+// where the sender was (config.h draws the circuit). The chain per pot:
+//
+//   ohms      ratiometric, so the 3.3 V rail cancels out
+//   open?     above POT_OPEN_OHMS for POT_OPEN_MS = broken wire: publish the
+//             pot's failsafe percent instead of chasing a floating pin
+//   percent   linear between the two calibration ends, clamped
+//   EMA       a short low-pass: a pot wiper is scratchy, and the loom
+//             carrying it runs next to PWMed fan wiring
+//   deadband  snap to exactly 0 / 100 near the ends, so "off" is really off
+//             and "full" is really full whatever the pot's end resistance
+//   report    only move the published value once the filtered one has
+//             travelled POT_REPORT_STEP: without this the last digit would
+//             flicker and every flicker would send CAN frames
+//   active    on/off with hysteresis - the bit that asks the PDM for power
+
+static void readPots()
     {
-    g_data.sw.headlights = readSwitch12V(PIN_HEADLIGHTS, g_data.sw.headlights);
-    g_data.sw.brights    = readSwitch12V(PIN_BRIGHTS,    g_data.sw.brights);
-    g_data.sw.blinkerL   = readSwitch12V(PIN_BLINKER_L,  g_data.sw.blinkerL);
-    g_data.sw.blinkerR   = readSwitch12V(PIN_BLINKER_R,  g_data.sw.blinkerR);
+    static float    s_filtered[POT_COUNT];
+    static bool     s_primed[POT_COUNT];
+    static uint32_t s_openSinceMs[POT_COUNT]; // 0 = not reading open
+
+    const uint32_t now   = millis();
+    const float    alpha = (TICK_FAST_MS / 1000.0f) / POT_FILTER_TAU_S;
+
+    for (uint8_t i = 0; i < POT_COUNT; i++)
+        {
+        PotData&      p   = g_data.sw.pot[i];
+        const PotCal& cal = POT_CAL[i];
+
+        const int raw = analogRead(PIN_POT[i]);
+        p.rawCounts   = (uint16_t)raw;
+        p.ohms        = dividerOhms(raw, POT_PULLUP_OHMS);
+
+        if (p.ohms > POT_OPEN_OHMS)
+            {
+            // Hold the last value for POT_OPEN_MS (a wiper lifting for an
+            // instant looks exactly like this), then fall to the failsafe.
+            if (s_openSinceMs[i] == 0) s_openSinceMs[i] = now ? now : 1;
+            if (now - s_openSinceMs[i] >= POT_OPEN_MS)
+                {
+                p.open        = true;
+                p.pct         = cal.failsafePct;
+                p.active      = (cal.failsafePct > 0);
+                s_primed[i]   = false; // re-seed the filter when the wire returns
+                }
+            continue;
+            }
+        s_openSinceMs[i] = 0;
+        p.open           = false;
+
+        float pct = (p.ohms - cal.ohmsAt0) / (cal.ohmsAt100 - cal.ohmsAt0) * 100.0f;
+        pct = constrain(pct, 0.0f, 100.0f);
+
+        if (!s_primed[i])
+            {
+            s_filtered[i] = pct; // first sample (boot, or back from open): jump there
+            s_primed[i]   = true;
+            p.pct         = pct;
+            }
+        else
+            {
+            s_filtered[i] += alpha * (pct - s_filtered[i]);
+            }
+
+        float out = s_filtered[i];
+        if (out < POT_END_DEADBAND)                out = 0.0f;
+        else if (out > 100.0f - POT_END_DEADBAND)  out = 100.0f;
+
+        // Publish on a real move, and always let the two end stops through
+        // (otherwise the report step could strand the value at 99.4).
+        if (fabsf(out - p.pct) >= POT_REPORT_STEP
+            || ((out == 0.0f || out == 100.0f) && out != p.pct))
+            p.pct = out;
+
+        if (p.pct >= POT_ON_PCT)       p.active = true;
+        else if (p.pct <= POT_OFF_PCT) p.active = false;
+        // in between: keep the previous answer (hysteresis)
+        }
     }
 
 // --- board housekeeping --------------------------------------------------------------
@@ -265,7 +374,7 @@ static void readBoard()
 
 static time_t readRtc()
     {
-    return Teensy3Clock.get(); // battery-backed RTC on the Teensy 4.0
+    return Teensy3Clock.get(); // the RT1062's battery-backed RTC (coin cell on VBAT)
     }
 
 void inputsInit()
@@ -273,18 +382,31 @@ void inputsInit()
     analogReadResolution(ADC_RESOLUTION_BITS);
     analogReadAveraging(ADC_AVERAGING);
 
-    // INPUT_DISABLE turns off the digital input buffer + keeper resistor on
-    // pins used purely as analog inputs - the keeper would otherwise distort
-    // high-impedance readings (a known Teensy 4 gotcha).
-    const uint8_t analogPins[] = { PIN_FUEL_SENDER, PIN_ROTARY, PIN_HEADLIGHTS,
-                                   PIN_BRIGHTS, PIN_BLINKER_L, PIN_BLINKER_R };
-    for (uint8_t pin : analogPins) pinMode(pin, INPUT_DISABLE);
+    // INPUT_DISABLE turns off the keeper resistor on pins used purely as
+    // analog inputs - the keeper would otherwise distort high-impedance
+    // readings (a known Teensy 4 gotcha, and these inputs now sit behind
+    // 22k series resistors).
+    pinMode(PIN_FUEL_SENDER, INPUT_DISABLE);
+    pinMode(PIN_ROTARY, INPUT_DISABLE);
+    for (uint8_t pin : PIN_POT) pinMode(pin, INPUT_DISABLE);
+
+    // Roof switches: plain inputs - the external 4.7k is the pull-up, and the
+    // chip's own (~22k) must stay OFF or a closed switch would idle at mid
+    // rail behind the 22k series resistor. pinMode(INPUT) also leaves the
+    // pad's Schmitt trigger off, so switch that on by hand: the release edge
+    // of these inputs is a slow RC ramp.
+    for (uint8_t pin : PIN_ROOF_SWITCH)
+        {
+        pinMode(pin, INPUT);
+        *portControlRegister(pin) |= IOMUXC_PAD_HYS;
+        }
 
     setSyncProvider(readRtc); // TimeLib: pull the time from the RTC now and
                               // resync periodically from here on
 
-    Serial.printf("Inputs up: ADC %u-bit, x%u averaging. RTC %s.\n",
+    Serial.printf("Inputs up: ADC %u-bit, x%u averaging, %u switches, %u pots. RTC %s.\n",
                   ADC_RESOLUTION_BITS, ADC_AVERAGING,
+                  (unsigned)ROOF_SWITCH_COUNT, (unsigned)POT_COUNT,
                   (year() > 2020) ? "has a valid time" : "NOT SET (clock will read --:--)");
     }
 
@@ -292,6 +414,7 @@ void inputsPoll()
     {
     readFuelSender();
     readRotary();
-    readSwitches();
+    readRoofSwitches();
+    readPots();
     readBoard();
     }

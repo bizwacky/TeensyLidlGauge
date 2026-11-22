@@ -39,7 +39,10 @@ void modesUpdate()
     // instead of blue, to spare night vision). Headlights are the natural
     // signal - if you can't see the road you turn them on - and selecting
     // Dark mode is the driver saying the same thing explicitly.
-    m.night = g_data.sw.headlights || (m.mode == MODE_DARK);
+    // The headlight state is no longer a wire into the gauge: it is what the
+    // PDMs report they are driving (pdm.cpp), held at its last known value
+    // while a PDM is silent so a CAN fault can't flip the colors mid-stage.
+    m.night = g_data.lamps.nightHint || (m.mode == MODE_DARK);
 
     // Brightness: the three brightness modes force their level; every other
     // mode (Silent, Fuel Reset, Debug, unassigned) defaults to MEDIUM -
@@ -49,16 +52,22 @@ void modesUpdate()
     // on a night stage, this default is the line to revisit.
     // LEDs and screen backlights resolve from the same dial position but
     // keep separate values: the strip and the panels are different light
-    // sources and may want different tuning one day.
+    // sources and may want different tuning one day. The switch-label
+    // backlights are a third: same chain as the tach, but lit to be read,
+    // not noticed.
     switch (m.mode)
         {
         case MODE_BRIGHT: m.ledBrightness    = LED_BRIGHTNESS_BRIGHT;
+                          m.labelBrightness  = LED_BACKLIGHT_BRIGHT;
                           m.screenBrightness = SCREEN_BRIGHTNESS_BRIGHT; break;
         case MODE_MEDIUM: m.ledBrightness    = LED_BRIGHTNESS_MEDIUM;
+                          m.labelBrightness  = LED_BACKLIGHT_MEDIUM;
                           m.screenBrightness = SCREEN_BRIGHTNESS_MEDIUM; break;
         case MODE_DARK:   m.ledBrightness    = LED_BRIGHTNESS_DARK;
+                          m.labelBrightness  = LED_BACKLIGHT_DARK;
                           m.screenBrightness = SCREEN_BRIGHTNESS_DARK;   break;
         default:          m.ledBrightness    = LED_BRIGHTNESS_MEDIUM;
+                          m.labelBrightness  = LED_BACKLIGHT_MEDIUM;
                           m.screenBrightness = SCREEN_BRIGHTNESS_MEDIUM; break;
         }
 

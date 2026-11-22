@@ -1,10 +1,13 @@
 # Rally CAN Gauge firmware
 
-Firmware for the E30 rally car gauge cluster: Teensy 4.0 driving three
+Firmware for the E30 rally car gauge cluster: a SparkFun MicroMod Teensy
+(it replaced the Teensy 4.0 in Nov 2026; same pin numbers) driving three
 ER-TFT2.79-1 displays (NV3007 controller) over SPI, fed by CAN data from the
-rusEFI ECU (a Super uaEFI) and the JK BMS. The full hardware/software plan
-(`Rally CAN Gauge Project Plan.md`) lives in the local project folder
-alongside the firmware and is not part of this repository.
+rusEFI ECU (a Super uaEFI), the JK BMS and the car's two dingoFW PDMs. The
+gauge also reads the roof switch panel (six switches, five pots) and sends
+it to the PDMs over CAN - it is the car's light-switch node - and drives
+three PWM speed signals for the cabin fans. The full hardware/software plan
+(`Rally CAN Gauge Project Plan`) lives outside this repository.
 
 ## Opening the project
 
@@ -24,13 +27,17 @@ pio run -e display_test -t upload
 
 ```
 CAN interrupt -> ring buffer -> canBusPoll() ---+
-ADC pins  ------> inputsPoll()  (20 ms tick) ---+--> g_data (raw + derived:
-RTC + die temp -/                                |    mixture window, fuel calc)
+ADC + switch pins -> inputsPoll() (20 ms tick) -+--> g_data (raw + derived: PDM
+RTC + die temp -/                                |    verdicts, mixture window,
+                                                 |    fuel calc)
                                                  alarmsUpdate()
                                                        v
                                                 g_data.alarms ---> audio (1 Hz),
                                                 (verdicts)     LED tach + screens
                                                                (50 Hz)
+
+roof switches + pots (g_data) ---> canBusTick20ms() ---> the PDMs
+                              \--> fansUpdate() -------> 3x fan PWM
 ```
 
 Two layers by design: input modules establish *what is* (temperatures,
@@ -53,7 +60,12 @@ the watchdog and the chip hard-resets within ~1 s.
 - `src/vehicle_data.h/.cpp` - the central data model (`g_data`), including
   the alarm catalog enum (ordered by the plan's priorities).
 - `src/alarms.h/.cpp` - the warning/alarm state machine: one table row per
-  alarm (name, color, priority, persistence, audio clip, condition).
+  alarm (name, color, tier, persistence, audio clip, condition), 36 rows in
+  priority order. The PDM rows class a fault by what it costs (engine,
+  cooling, vision, body) and name the load on the banner (`PUMP FLT`).
+- `src/led_tach.h/.cpp` - the WS2812 strip: 3 status LEDs, the 12-LED tach
+  and shift light, plus the switch-label backlights wired onto the end of
+  the same chain (one steady color, never part of the flashing).
 - `src/audio.h/.cpp` - voice-callout arbitration (priority, repeat intervals,
   no talking over itself) plus the DFPlayer Mini driver (Makuna/DFMiniMp3 on
   Serial7, pins 28/29, watchdog-safe NoAck mode - design notes at the top
@@ -70,19 +82,34 @@ the watchdog and the chip hard-resets within ~1 s.
 - `src/watchdog.h/.cpp` - minimal register driver for the i.MX RT's WDOG1.
 - `src/can_bus.h/.cpp` - CAN3 + the decoders: rusEFI's native broadcast
   (frames BASE0..7, layouts from rusEFI's own DBC), the one target-AFR byte
-  from rusEFI's MS Simplified broadcast, and the JK BMS Deye protocol (1 Hz)
-  - all little-endian - plus the 1 Hz PCS heartbeat the BMS expects from an
-  "inverter". Every frame is counted as decoded, ignored (expected traffic
-  we don't use) or unknown, so a misconfigured bus shows up as `unk=`.
+  from rusEFI's MS Simplified broadcast, the JK BMS Deye protocol (1 Hz)
+  and both PDMs' dingoFW status frames (10 Hz, driven by the `PDM_FRAMES`
+  table in `config.h`) - all little-endian. It transmits the 1 Hz PCS
+  heartbeat the BMS expects from an "inverter" and the two frames that
+  carry the roof switches and pots to the PDMs (10 Hz + on change; every
+  switch is sent as an on bit and an off bit so the PDM config can make
+  lamps fail ON). Every frame is counted as decoded, ignored (expected
+  traffic we don't use) or unknown, so a misconfigured bus shows up as
+  `unk=`.
+- `src/pdm.h/.cpp` - what the PDM status means: a verdict per output (OK /
+  TRP tripped / OPN open load / FLT faulted or stuck) with the memory those
+  need, the lamp states the indicator icons and night mode read, and the
+  last output event for the black box. Rules and the dingoFW behaviour they
+  rest on at the top of the .cpp.
+- `src/fans.h/.cpp` - three 25 kHz PWM speed signals for the defrost and
+  seat fans, each set by a roof-panel pot.
 - `src/mixture.h/.cpp` - the gated two-second lambda window the AFR alarms
   judge: samples only count while the driver is on the throttle, rusEFI
   isn't cutting fuel, and the sensor has recovered from the last time that
   wasn't true - so overrun and fuel cut can't raise AFR LEAN.
 - `src/inputs.h/.cpp` - fuel sender (ratiometric 150R divider, including
   the two-stage slosh filter: median window + slow EMA), rotary switch
-  (2.2k pull-up into an 11 x 220R ladder, decoded in ohms, with open-wiper
-  detection feeding the DIALFAIL alarm and a fail-safe fallback to Bright),
-  12V switches, chip temp, RTC. Both divider circuits are drawn in `config.h`.
+  (4.7k pull-up into eleven resistors chosen for even voltage steps, decoded
+  by nearest expected ratio, with open-wiper detection feeding the DIALFAIL
+  alarm and a fail-safe fallback to Bright), the roof panel's six
+  ground-switched switches (debounced) and five pots (rheostats, percent of
+  travel, open-wire failsafe), chip temp, RTC. The circuits are drawn in
+  `config.h`.
 - `src/fuel_calc.h/.cpp` - calculated fuel: integrates the ECU's injector
   pulse width (dead-time corrected) into a gallons-remaining estimate, and
   runs the rotary FUEL FILL gesture (hold 30 s = +5 gal, 60 s = full tank).
@@ -93,7 +120,8 @@ the watchdog and the chip hard-resets within ~1 s.
   bus), blocking reads for boot/console, shared CRC-16.
 - `src/fram_log.h/.cpp` - what the FRAM stores: the persistent fuel record
   (16 rotating CRC'd slots - kill-switch-proof) and the black-box flight
-  recorder (~2 h circular log of every gauge field + active alarms), plus
+  recorder (~1.8 h circular log of every gauge field, PDM temperatures and
+  output events, roof switches + active alarms), plus
   the serial console (`h` in the monitor: CSV dump, fuel slots, format).
   **See `docs/FRAM_BLACKBOX.md`** for the memory map, record formats,
   wiring, and how to read the log out.
@@ -125,6 +153,10 @@ the watchdog and the chip hard-resets within ~1 s.
 - `docs/BMS_CAN_SETUP.md` - the JK BMS protocol selection (Deye/001), the
   frames decoded, BMS bring-up checks, and the table of every CAN id on the
   bus.
+- `docs/PDM_CAN_SETUP.md` - **the dingoConfig settings the firmware
+  expects**: Base IDs, the status frames decoded (including the proposed
+  frames for outputs 9-14), the two frames the gauge sends, the CAN-input
+  recipe that makes lamps fail on, and the bench checks.
 - `lib/ILI9341_T4/` - vindar's ILI9341_T4 DMA display library, modified for
   the NV3007 controller. **Read `lib/ILI9341_T4/PORTING_NV3007.md`** for a
   walkthrough of every change and why it was needed. It is vendored from

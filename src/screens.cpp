@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 // THE MEMORY LAYOUT (the part worth understanding first):
 //
-// A 428x142 RGB565 frame is 121 KB. The Teensy 4.0 has two RAM banks:
+// A 428x142 RGB565 frame is 121 KB. The Teensy's RT1062 has two RAM banks:
 // 512 KB of fast DTCM (where normal variables and the stack live) and
 // 512 KB of OCRAM (the "DMAMEM" region - slower for the CPU, but the DMA
 // engines read it without competing with code execution). Four full frames
