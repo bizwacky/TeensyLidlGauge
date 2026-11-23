@@ -5,7 +5,7 @@
 // (g_data.mode.screenBrightness + displaysOff) and drives the three
 // backlight PWM pins. Per-screen trim, polarity, phase offsets, fade and
 // all other tunables live in config.h, along with the hardware story (the
-// FET switch, why 20 kHz, why the three pins all sit on FlexPWM4). The
+// FET switch, why 20 kHz, why the three pins all sit on FlexPWM2). The
 // FlexPWM register mechanics are written up at the top of backlight.cpp.
 // ---------------------------------------------------------------------------
 
@@ -22,8 +22,8 @@ void backlightUpdate(); // call on the 20 ms tick, after modesUpdate()
 // watch while tuning BL_TRIM on the bench.
 float backlightDutyPct(uint8_t screen);
 
-// Did backlightInit() confirm submodule 2 (pins 2/3) running in lockstep
-// with submodule 0 (pin 22)? false = it fell back to free-running counters:
-// every pin still gets correct PWM, but the phase between pin 22 and pins
-// 2/3 is whatever it happens to be. Bench diagnostic.
+// Did backlightInit() confirm submodule 2 (pin 9) running in lockstep
+// with submodule 0 (pins 33/4)? false = it fell back to free-running
+// counters: every pin still gets correct PWM, but the phase between pin 9
+// and pins 33/4 is whatever it happens to be. Bench diagnostic.
 bool backlightPhaseLocked();

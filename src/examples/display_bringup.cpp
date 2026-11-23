@@ -1,22 +1,23 @@
 // ---------------------------------------------------------------------------
 // Rally CAN Gauge - display bring-up test
 // ---------------------------------------------------------------------------
-// First-light sketch for ONE ER-TFT2.79-1 (NV3007) on the MicroMod Teensy
-// (the same pins as on the Teensy 4.0 it replaced), using the modified
-// ILI9341_T4 library in lib/ILI9341_T4 (see PORTING_NV3007.md).
+// First-light sketch for ONE ER-TFT2.79-1 (NV3007) on the MicroMod Teensy,
+// using the modified ILI9341_T4 library in lib/ILI9341_T4 (see
+// PORTING_NV3007.md).
 //
-// Wiring (display 1 / "SPI0" from the pin map in src/config.h):
+// Wiring (display 1 on the rev 2 gauge PCB = SPI2; the pins must match
+// SCREEN_PINS[0] and PIN_BACKLIGHT[0] in src/config.h):
 //
 //   display pin        Teensy pin
 //   -----------        ----------
-//   1  SDA      ->     11  (SPI0 MOSI)
-//   2  SCL      ->     13  (SPI0 SCK)
-//   3  RS  (DC) ->     10  (hardware CS pin -> big speedup, see library docs)
-//   4  RSTB     ->      6
-//   5  CS       ->      9
-//   6  TE       ->     (unconnected for now - future tear-free sync)
+//   1  SDA      ->     35  (SPI2 MOSI)
+//   2  SCL      ->     37  (SPI2 SCK)
+//   3  RS  (DC) ->     36  (hardware CS pin -> big speedup, see library docs)
+//   4  RSTB     ->     45
+//   5  CS       ->      6
+//   6  TE       ->     34  (wired, not read yet - future tear-free sync)
 //   7  VDD      ->     3.3V
-//   8  LEDK     ->     21R ballast -> N-FET drain; FET gate on pin 2 (PWM)
+//   8  LEDK     ->     21R ballast -> N-FET drain; FET gate on pin 9 (PWM)
 //   9  LEDA     ->     +5V
 //                      (the gauge PCB's backlight switch - circuit drawn at
 //                       PIN_BACKLIGHT in src/config.h)
@@ -42,13 +43,13 @@
 
 // --- pins -------------------------------------------------------------------
 
-static const uint8_t PIN_CS = 9;
-static const uint8_t PIN_DC = 10;   // on a hardware CS pin -> accelerated DC
-static const uint8_t PIN_SCK = 13;
-static const uint8_t PIN_MOSI = 11;
+static const uint8_t PIN_CS = 6;
+static const uint8_t PIN_DC = 36;   // on a hardware CS pin -> accelerated DC
+static const uint8_t PIN_SCK = 37;
+static const uint8_t PIN_MOSI = 35;
 static const uint8_t PIN_MISO = 255; // the NV3007 has no MISO line
-static const uint8_t PIN_RST = 6;
-static const uint8_t PIN_BACKLIGHT = 2; // PWM
+static const uint8_t PIN_RST = 45;
+static const uint8_t PIN_BACKLIGHT = 9; // PWM
 
 // --- display geometry ---------------------------------------------------------
 // Rotation 0 is native landscape 428x142, matching the mounted orientation of

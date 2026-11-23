@@ -17,10 +17,11 @@
 //
 // WHY NOT analogWrite(): it can only make windows that START at counter
 // zero, so all three backlights would switch on in the same instant and
-// the 5V rail would see one 300 mA step per cycle. The point of the pin
-// shuffle (config.h, PIN_BACKLIGHT) was to get all three channels onto
-// FlexPWM4 so the windows can be spread a third of a period apart - and
-// that needs the compare registers written directly. Everything else -
+// the 5V rail would see one 300 mA step per cycle. The backlight pins
+// (config.h, PIN_BACKLIGHT) are chosen to put all three channels on ONE
+// FlexPWM module - FlexPWM2 on the rev 2 board - so the windows can be
+// spread a third of a period apart, and placing them there needs the
+// compare registers written directly. Everything else -
 // clocking, prescaler, period, pin mux, output enable - is still done by
 // the Teensy core's analogWriteFrequency()/analogWrite(), exactly as
 // before; only the window placement lives here.
@@ -50,7 +51,7 @@
 // physics as the WS2812 strip. The nonlinearity of human vision is baked
 // into the three chosen SCREEN_BRIGHTNESS_* numbers, not a runtime curve.
 //
-// BENCH CHECK: scope pins 2, 3 and 22 together in Bright mode. Expect
+// BENCH CHECK: scope pins 9, 33 and 4 together in Bright mode. Expect
 // three 20 kHz square waves with their rising edges a third of a period
 // (16.7 us) apart; the boot line "[BL  ] ... phase-locked" confirms the
 // counter lock was measured. Set BL_PHASE to all zeros and the edges
@@ -64,25 +65,29 @@
 #include "vehicle_data.h"
 
 // --- the hardware map -----------------------------------------------------------
-// Which FlexPWM4 submodule/channel each backlight pin lands on, from the
+// Which FlexPWM2 submodule/channel each backlight pin lands on, from the
 // Teensy core's pin table (cores/teensy4/pwm.c). The core resolves this
 // itself inside analogWrite(); we need it to reach the same registers.
-// If PIN_BACKLIGHT ever changes, this table must change with it.
+// If PIN_BACKLIGHT ever changes, this table AND BL_PWM must change with
+// it. The rest of this file assumes only that the three channels live on
+// submodules 0 and 2 of one module (k_smMask, and submodule 2 slaved to
+// submodule 0 in backlightInit) - true of FlexPWM2 here, as it was of
+// FlexPWM4 on the previous board.
 
 struct BlChannel
     {
-    uint8_t submodule; // FlexPWM4 submodule 0..3
+    uint8_t submodule; // FlexPWM2 submodule 0..3
     bool    chanB;     // false = channel A (VAL2/VAL3), true = channel B (VAL4/VAL5)
     };
 
 static const BlChannel k_chan[3] =
     {
-    { 2, false }, // pin 2  = FlexPWM4_2_A  (display 1)
-    { 2, true  }, // pin 3  = FlexPWM4_2_B  (display 2)
-    { 0, false }, // pin 22 = FlexPWM4_0_A  (display 3)
+    { 2, true  }, // pin 9  = FlexPWM2_2_B  (display 1)
+    { 0, true  }, // pin 33 = FlexPWM2_0_B  (display 2)
+    { 0, false }, // pin 4  = FlexPWM2_0_A  (display 3)
     };
 
-#define BL_PWM IMXRT_FLEXPWM4
+#define BL_PWM IMXRT_FLEXPWM2
 static const uint8_t k_smMask         = (1 << 0) | (1 << 2); // the submodules we own
 static const int32_t k_syncTolerance  = 8;                   // counts (= 53 ns at 150 MHz)
 
@@ -169,7 +174,7 @@ void backlightInit()
     {
     // 1. Let the core set up each pin: prescaler + period for BL_PWM_HZ,
     //    output enable, pin mux, and a 0 duty so nothing lights before the
-    //    fade-in. (Pins 2 and 3 share submodule 2 - the second frequency
+    //    fade-in. (Pins 33 and 4 share submodule 0 - the second frequency
     //    call just rewrites the same period.)
     for (uint8_t i = 0; i < 3; i++)
         {
@@ -230,11 +235,11 @@ void backlightInit()
     // prescaler only when the period would overflow 16 bits, i.e. below
     // ~2.3 kHz - not at 20 kHz, but the print should stay honest).
     const uint32_t prescale = (BL_PWM.SM[0].CTRL >> 4) & 0x7;
-    Serial.printf("[BL  ] FlexPWM4 %lu Hz, period %u counts, phases %.2f/%.2f/%.2f - %s"
+    Serial.printf("[BL  ] FlexPWM2 %lu Hz, period %u counts, phases %.2f/%.2f/%.2f - %s"
                   " (SM0/SM2 skew %ld counts%s%s)\n",
                   (unsigned long)((F_BUS_ACTUAL >> prescale) / (uint32_t)(s_modulo + 1)),
                   (unsigned)(s_modulo + 1), BL_PHASE[0], BL_PHASE[1], BL_PHASE[2],
-                  s_locked ? "phase-locked" : "NOT LOCKED, pins 2/3 free-running",
+                  s_locked ? "phase-locked" : "NOT LOCKED, pin 9 free-running",
                   (long)worst, overrun ? ", SM2 overran VAL1" : "",
                   (modulo2 != s_modulo) ? ", period mismatch" : "");
     }

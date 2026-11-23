@@ -1,7 +1,8 @@
 # Rally CAN Gauge firmware
 
 Firmware for the E30 rally car gauge cluster: a SparkFun MicroMod Teensy
-(it replaced the Teensy 4.0 in Nov 2026; same pin numbers) driving three
+(it replaced the Teensy 4.0 in Nov 2026; the rev 2 PCB then moved 31 of the
+46 pins - the map is at the top of `src/config.h`) driving three
 ER-TFT2.79-1 displays (NV3007 controller) over SPI, fed by CAN data from the
 rusEFI ECU (a Super uaEFI), the JK BMS and the car's two dingoFW PDMs. The
 gauge also reads the roof switch panel (six switches, five pots) and sends
@@ -73,7 +74,7 @@ the watchdog and the chip hard-resets within ~1 s.
   SD card layout is documented on the clip enum in `audio.h`; the rotary
   dial's silent position (`MODE_SILENT`) mutes all callouts.
 - `src/backlight.h/.cpp` - display backlight dimming: 20 kHz PWM into three
-  low-side N-FET switches (pins 2/3/22 - all on FlexPWM4 so the three
+  low-side N-FET switches (pins 9/33/4 - all on FlexPWM2 so the three
   windows can be locked a third of a period apart: the 5V rail sees one
   100 mA step at a time instead of 300 mA), brightness from the rotary mode
   with per-screen binning trim (`BL_TRIM`) and a 250 ms fade between
@@ -165,7 +166,8 @@ the watchdog and the chip hard-resets within ~1 s.
 
 ## Display driving in one paragraph
 
-Each display gets its own SPI bus (SPI0/1/2 on the Teensy). We draw into a
+Each display gets its own SPI bus (display 1 on SPI2, display 2 on SPI1,
+display 3 on SPI). We draw into a
 428x142 RGB565 framebuffer in RAM, then `tft.update(fb)` hands it to the
 library, which diffs it against what is already on screen and streams only
 the changed pixels out via DMA - the CPU is free almost the entire time.
