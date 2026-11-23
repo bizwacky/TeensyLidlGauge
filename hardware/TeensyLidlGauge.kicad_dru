@@ -1,0 +1,45 @@
+(version 1)
+# TeensyLidlGauge rev 2 - custom design rules
+# Fab: JLCPCB 4-layer, 1 oz outer / 0.5 oz inner, stackup JLC04161H-7628. Numbers from jlcpcb.com/capabilities/pcb-capabilities
+# (read 22 Nov 2026). The board-setup constraints hold the global floors; the rules below add what a single global number cannot.
+
+(rule "JLC: PTH pad annular ring (0.15 abs. min, 0.20 recommended)"
+	(condition "A.Type == 'Pad' && A.Pad_Type == 'Through-hole'")
+	(constraint annular_width (min 0.15mm)))
+
+(rule "JLC: PTH pad hole to other copper (0.28 min / 0.35 rec. outer, 0.30 inner)"
+	(condition "A.Type == 'Pad' && A.Pad_Type == 'Through-hole'")
+	(constraint hole_clearance (min 0.3mm)))
+
+(rule "JLC: component hole to component hole"
+	(condition "A.Type == 'Pad' && B.Type == 'Pad'")
+	(constraint hole_to_hole (min 0.45mm)))
+
+(rule "JLC: SMD pad to pad, different nets"
+	(condition "A.Type == 'Pad' && B.Type == 'Pad' && A.Net != B.Net")
+	(constraint clearance (min 0.15mm)))
+
+# M3 mounting holes H2-H7: keep copper clear of the screw head / boss (3.4 mm radius = 1.6 mm hole + 1.8 mm)
+(rule "M3 mounting hole: screw-head keepout"
+	(condition "A.Type == 'Pad' && A.Pad_Type == 'NPTH, mechanical' && A.memberOfFootprint('H?')")
+	(constraint hole_clearance (min 1.8mm)))
+
+# The socket footprint's courtyard deliberately covers the whole MicroMod card. 0402 passives (0.35-0.55 mm tall) are
+# allowed underneath it; anything else under the card still raises a courtyard error. (SparkFun: < 1.9 mm under the card
+# with the 4.2 mm connector; the footprint note says <= 1 mm.)
+(rule "0402 passives allowed under the MicroMod card"
+	(severity ignore)
+	(condition "A.Reference == 'U4' && (B.Library_Link == 'Resistor_SMD:R_0402_1005Metric' || B.Library_Link == 'Capacitor_SMD:C_0402_1005Metric')")
+	(constraint courtyard_clearance (min 0mm)))
+(rule "0402 passives allowed under the MicroMod card (mirror)"
+	(severity ignore)
+	(condition "B.Reference == 'U4' && (A.Library_Link == 'Resistor_SMD:R_0402_1005Metric' || A.Library_Link == 'Capacitor_SMD:C_0402_1005Metric')")
+	(constraint courtyard_clearance (min 0mm)))
+
+# USB 2.0 high-speed pair (net class USB: 0.30 mm tracks, 0.20 mm gap = ~90 ohm on 0.21 mm 7628 prepreg over In1 GND)
+(rule "USB: pair skew"
+	(condition "A.NetClass == 'USB'")
+	(constraint skew (max 1mm)))
+(rule "USB: uncoupled length"
+	(condition "A.NetClass == 'USB'")
+	(constraint diff_pair_uncoupled (max 6mm)))
