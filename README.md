@@ -1,60 +1,172 @@
-# Rally CAN Gauge firmware
+# Teensy Lidl Gauge
 
-Firmware for the E30 rally car gauge cluster: a SparkFun MicroMod Teensy
-(it replaced the Teensy 4.0 in Nov 2026; the rev 2 PCB then moved 31 of the
-46 pins - the map is at the top of `src/config.h`) driving three
-ER-TFT2.79-1 displays (NV3007 controller) over SPI, fed by CAN data from the
-rusEFI ECU (a Super uaEFI), the JK BMS and the car's two dingoFW PDMs. The
-gauge also reads the roof switch panel (six switches, five pots) and sends
-it to the PDMs over CAN - it is the car's light-switch node - and drives
-three PWM speed signals for the cabin fans. The full hardware/software plan
-(`Rally CAN Gauge Project Plan`) lives outside this repository.
+This is a set of gauges for my BMW E30 rally car, designed to be viewed in the peripheral vision, alerting to situations that need attention or immediate action and otherwise mostly being ignored while my OODA loop focuses on the stage ahead.
 
-## Opening the project
+<p align="center">
+  <img src="hardware/Enclosure/exploded.png" width="85%" alt="Exploded view: patterned cover, PCB in the tray, three displays behind a lens, dash-bar clamps">
+</p>
 
-This is a standard PlatformIO project: in VS Code with the PlatformIO
-extension, use "Open Folder" on the root of this repository. Or from a
-terminal:
+Three ER-TFT2.79-1 bar displays (NV3007 controller), driven over SPI by a
+SparkFun MicroMod Teensy (it replaced the Teensy 4.0 in Nov 2026; the rev 2
+PCB then moved 31 of the 46 pins - the map is at the top of `src/config.h`),
+fed by CAN data from the rusEFI ECU (a Super uaEFI), the JK BMS and the
+car's two dingoFW PDMs. The gauge also reads the roof switch panel (six
+switches, five pots) and sends it to the PDMs over CAN - it is the car's
+light-switch node - and drives three PWM speed signals for the cabin fans.
 
-```
-pio run                        # build the main gauge firmware
-pio run -t upload              # flash the Teensy
-pio device monitor             # serial output (115200)
-pio run -e display_test        # build the display bring-up test instead
-pio run -e display_test -t upload
-```
+This repository holds the firmware (`src/`, `lib/`, `docs/`) and, in
+[`hardware/`](hardware/), the KiCad project, fab outputs and the 3D-printed
+enclosure. The full hardware/software plan (`Rally CAN Gauge Project Plan`)
+lives outside this repository.
 
-## Architecture
+**Status (Nov 2026):** the v1.0 board is at the ordering stage. It has not
+been built or tested yet, so treat the hardware files as a design under
+review, not a proven board.
 
-```
-CAN interrupt -> ring buffer -> canBusPoll() ---+
-ADC + switch pins -> inputsPoll() (20 ms tick) -+--> g_data (raw + derived: PDM
-RTC + die temp -/                                |    verdicts, mixture window,
-                                                 |    fuel calc)
-                                                 alarmsUpdate()
-                                                       v
-                                                g_data.alarms ---> audio (1 Hz),
-                                                (verdicts)     LED tach + screens
-                                                               (50 Hz)
+## Design philosophy
 
-roof switches + pots (g_data) ---> canBusTick20ms() ---> the PDMs
-                              \--> fansUpdate() -------> 3x fan PWM
-```
+- **Peripheral, not focal.** Most of the time the right amount of attention
+  to pay the gauge is none. Green means there is nothing to do; colour
+  carries the urgency, and a voice says the important part so the eyes can
+  stay on the stage.
+- **Urgency has four colours.** Red: act now, it changes the outcome.
+  Yellow, live: change how you drive or what is switched on. Yellow,
+  deferred: nothing to do until the car stops. Blue: information. A one-line
+  banner names the problem (`OIL LOW`, `PUMP FLT`), critical banners flash
+  at 1 Hz, and GPWS-style voice callouts repeat it without talking over
+  each other.
+- **One judge, many messengers.** Input code establishes what *is*
+  (temperatures, pressures, link freshness); one alarm table decides what
+  *matters*; the screens, LEDs and audio only render its verdicts. No
+  display code ever touches a threshold, so the screen can never disagree
+  with the alarm about when "hot" starts. A driver who sees them disagree
+  learns to trust neither.
+- **Absent data looks absent.** A dead sensor or a dropped CAN link draws as
+  `--`, never as a plausible 0 psi (which teaches panic) or a frozen last
+  value (which teaches complacency). Stale data raises no alarms of its own;
+  the link alarms (`NO CAN`, `BATT CAN`) report the staleness instead.
+- **One knob, no menus.** The rotary dial is the only control: bright,
+  medium, dark (night colours turn every blue element amber, which is kinder
+  to dark-adapted eyes), debug, silent, fuel fill and displays off. Anything
+  deeper is a code change on a laptop, not a menu at speed.
+- **Built to survive the car.** All vehicle I/O comes through one sealed
+  26-pin Superseal. The 12 V front end has reverse-polarity protection, a
+  36 V TVS, a switching 5 V module and a separate 3.3 V LDO. The fuel
+  record (in CRC'd rotating slots) and a black-box log live in F-RAM, so
+  the kill switch loses nothing, and a hardware watchdog resets hung
+  firmware within a second. The board is Signal / GND / GND / Signal, so
+  every signal has a solid ground plane next to it.
+- **Made by a fab, swappable where it matters.** The board is laid out for
+  turnkey assembly (JLCPCB and Pikkolo BOMs included); the DFPlayer audio
+  module is the only hand-installed part. The processor is a MicroMod card
+  in an M.2 socket held by one screw, so replacing or upgrading it needs a
+  screwdriver, not a soldering iron.
 
-Two layers by design: input modules establish *what is* (temperatures,
-voltages, link freshness) in the global `VehicleData g_data` struct; the
-alarm state machine judges *what matters* and publishes verdicts to
-`g_data.alarms`. Consumers (audio, screens, LED tach) read only verdicts -
-no display or audio code ever touches a threshold. The screens repeat the
-same split one level down: `gauge_render.cpp` decides what a frame *shows*
-(pure g_data -> pixels), `screens.cpp` decides how it *reaches the glass*
-(framebuffers, diffs, DMA). The superloop in `src/main.cpp` is a cooperative
-scheduler: CAN drains every pass, inputs + mixture window + fuel calc +
-alarms + LED strip + screens run on a 20 ms tick (which also feeds the
-hardware watchdog), housekeeping runs at 1 Hz. A hung firmware stops feeding
-the watchdog and the chip hard-resets within ~1 s.
+## Hardware
 
-## Layout
+<p align="center">
+  <img src="hardware/renders/pcb_front.png" width="49%" alt="PCB front render">
+  <img src="hardware/renders/pcb_back.png" width="49%" alt="PCB back render with the J2 pin-out table">
+</p>
+
+100 x 100 mm, four layers (Signal / GND / GND / Signal), 1.6 mm, laid out in
+KiCad 10 against JLCPCB's rules and their JLC04161H-7628 stackup (pick that
+stackup when ordering). The J2 pin-out is printed on the back of the board.
+
+| Block | Parts |
+|---|---|
+| Processor | SparkFun MicroMod Teensy in a TE 2199230-4 M.2 (E-key) socket |
+| Displays | 3x ER-TFT2.79-1 on 10-pin 0.5 mm FPC connectors (Amphenol SFV10R-2STE1HLF), one SPI bus each; PWM backlights through three low-side N-FETs |
+| Vehicle connector | TE Superseal 1.0, 26-pin (6473711-1): +12 V, CAN, six switch inputs, five pots, fuel sender, rotary dial, speaker, LED-strip data and 5 V, three fan PWM outputs |
+| CAN | TI TCAN1051HGV-Q1 |
+| Power | Traco TSR 3-2450N (5 V, 3 A), TI TLV75733P (3.3 V LDO), Panjit PJQ4465AP reverse-polarity P-FET, SMCJ36CA TVS |
+| Logging and sensors | 1 Mbit I2C F-RAM (FM24VN10 / FM24V10), ST LSM6DSV320X IMU (±320 g), CR2450 cell for the clock |
+| Audio | DFRobot DFPlayer Mini (DFR0299), hand-installed |
+| USB | 6-pin JST-PH (J1) to an Adafruit 6153 panel-mount USB-C, TPD2E2U06 ESD protection |
+
+### What is in `hardware/`
+
+| Path | What |
+|---|---|
+| `TeensyLidlGauge.kicad_pro`, `.kicad_pcb`, `.kicad_dru` and eight `.kicad_sch` sheets | KiCad 10 project: schematic, routed board, custom design rules |
+| `Library.pretty/`, `Parts/`, `3dmodels/` | the footprints, symbols and 3D models made for this project, at the project-relative paths the design expects (third-party library files are left out; see below) |
+| `Gerb/` | Gerbers and drill files, plus `TeensyLidlGauge-Gerb.zip` ready to upload |
+| `BOM/` | `JLCPCB_BOM_upload.csv` (LCSC part numbers) and `Pikkolo_BOM_upload.csv` (MPNs and distributor part numbers) |
+| `place/` | pick-and-place: `TeensyLidlGauge-JLC-CPL.csv` (JLCPCB format) and `TeensyLidlGauge-all-pos.csv` (KiCad format) |
+| `Enclosure/` | printable STLs, a STEP fit-check assembly, renders |
+| `renders/` | the PCB renders above |
+
+Ordering notes:
+
+- Left off both BOMs on purpose: J3 to J5 (9-pin display breakout headers,
+  do not populate) and H2 to H5 (M3 mounting holes). U7, the DFPlayer Mini,
+  is hand-installed after assembly: it is not on the JLCPCB BOM and is
+  marked that way in the Pikkolo BOM.
+- The Pikkolo BOM marks U3 (IMU), H1 (MicroMod standoff) and BT1 (coin-cell
+  holder) as customer-consigned.
+
+### Third-party library files
+
+Some symbols, footprints and 3D models came from SnapEDA, Ultra Librarian,
+LCSC/EasyEDA or the part makers, whose terms allow sharing a board design
+built with them but not re-uploading the library files themselves. Those
+files are not in this repository. Every footprint and symbol is still
+embedded in the `.kicad_pcb` and the schematic, so the project opens,
+checks and plots without them. KiCad may warn that the library copies are
+missing, and the 3D viewer shows these parts without bodies. For the full
+3D view, download the models by part number and save them at the paths
+given in each footprint's 3D model settings (most are under `Parts/`).
+
+| Ref | Part | Not included |
+|---|---|---|
+| U1 | TI TCAN1051HGVDRBRQ1 | footprint, symbol, 3D model |
+| U2 | TI TLV75733PDRVR | footprint, symbol, 3D model |
+| U3 | ST LSM6DSV320XTR | symbol |
+| U4 | TE 2199230-4 (M.2 socket) | 3D model |
+| U5 | TI TPD2E2U06QDBZRQ1 | footprint, symbol, 3D model |
+| U7 | DFRobot DFR0299 | footprint, symbol, 3D model |
+| Q2 | Panjit PJQ4465AP-AU_R2_000A1 | footprint, symbol |
+| D1 | onsemi SZBZX84C16LT1G | footprint, symbol, 3D model |
+| CR1 | Littelfuse SMCJ36CA | symbol |
+| PS1 | Traco TSR 3-2450N | footprint, symbol, 3D model |
+| S1 | Würth 435171014816 | footprint, symbol, 3D model |
+| BT1 | MYOUNG BS-24-B4AK014 | footprint, symbol, 3D model |
+| J1 | JST B6B-PH-SM4-TB | symbol |
+| J2 | TE 6473711-1 (Superseal) | footprint, 3D model |
+| J6 to J8 | Amphenol SFV10R-2STE1HLF | footprint, symbol, 3D model |
+
+### Enclosure
+
+<p align="center">
+  <img src="hardware/Enclosure/hero_bloom_rear.png" width="49%" alt="Enclosure, rear three-quarter view">
+  <img src="hardware/Enclosure/open_tray.png" width="49%" alt="Tray with the PCB and display bar, cover off">
+</p>
+<p align="center">
+  <img src="hardware/Enclosure/hero_bloom_top.png" width="49%" alt="Cover, top view">
+  <img src="hardware/Enclosure/on_bar.png" width="49%" alt="Mounted on a 1.75 inch dash bar with two clamps">
+</p>
+
+*Shrimplify, and add lightness.* A rusEFI-style two-piece printed case: a
+tray that carries the PCB and the display bar, and a cover that closes
+around the Superseal with a stepped profile into and in front of the
+connector lip, the way the rusEFI boxes do it. The Superseal faces the
+front of the car; the three displays sit side by side as one wide bar
+facing the driver; USB-C comes out the side through the Adafruit 6153
+bulkhead. The structure grades from industrial isogrid at the connector end
+into organic cells toward the screens ("a ULA rocket morphing into an
+Annihilation creature"), with topology-optimised buttresses carrying the
+display bar. It mounts on a 1.75 in dash bar with two printed clamps, or
+with screws through the dash panel. Candidate materials: PC FR, Liqcreate
+Flame Retardant HDT or PA12-CF (not settled).
+
+| File | What |
+|---|---|
+| `tray_R2_b2.stl` | tray: holds the PCB and the display bar |
+| `cover_R2_bloom.stl` | patterned cover |
+| `clamp_saddle_1p75in.stl`, `clamp_cap_1p75in.stl` | dash-bar clamp halves for a 1.75 in tube (the renders use two clamps) |
+| `assembly_R2_reference.step` | fit-check assembly with the PCB, lens and mask, USB-C, clamps and a 1.75 in bar (it uses unpatterned versions of the tray and cover) |
+
+## Firmware layout
 
 - `src/main.cpp` - the superloop (scheduler + 1 Hz debug print).
 - `src/config.h` - every pin, constant, threshold and tunable in one place.
@@ -174,17 +286,3 @@ the changed pixels out via DMA - the CPU is free almost the entire time.
 VSync is not available (the display has no MISO line to poll the scanline),
 but the TE pin is broken out on the module and reserved in the pinout for a
 possible future tear-free sync mod.
-
-## Memory budget (as built)
-
-Each display keeps a 121 KB internal framebuffer inside the 512 KB
-OCRAM/DMAMEM region (3 x 121 = 363 KB), plus ONE shared 121 KB draw
-framebuffer = 486 KB of the 512 KB used; the ~25 KB remainder is heap
-headroom (nothing in this firmware mallocs). The 20 ms tick draws each
-screen into the shared buffer sequentially: draw 1 -> update(1) -> draw 2 ->
-update(2) -> draw 3 -> update(3). The DMA transfers overlap the following
-draws because update() copies the changed pixels into the per-display
-internal buffer before returning. The six 8 KB diff buffers and all other
-variables live in the separate 512 KB DTCM bank. Fonts (~145 KB) stay in
-flash. Watch the 1 Hz `[SCRN]` debug line: worst-case draw time and the
-skipped-frame counter are the two health numbers for this pipeline.
