@@ -8,31 +8,42 @@
 // THE BOARD: a SparkFun MicroMod Teensy in an M.2 socket (it replaced the
 // Teensy 4.0 in Nov 2026). Pin numbers below are Teensyduino pin numbers,
 // which is also how the schematic names the MicroMod symbol's pins
-// ("7_Switch_1", "33_PWM_3"...). The whole map, as wired on the PCB:
+// ("5_Switch_1", "39_PWM_3"...). The whole map, as wired on the rev 2 PCB
+// (the one with the M.2 socket turned 180 degrees):
 //
-//    0  SPI1 DC (disp 2)     16  pot 3 (A2)            32  roof switch 2
-//    1  SPI1 TE (reserved)   17  pot 4 (A3)            33  fan PWM 3
-//    2  backlight 1 PWM      18  FRAM SDA              34  SPI2 TE (reserved)
-//    3  backlight 2 PWM      19  FRAM SCL              35  SPI2 MOSI (disp 3)
-//    4  fan PWM 1            20  SPI1 RESET            36  SPI2 DC
-//    5  fan PWM 2            21  SPI1 CS               37  SPI2 SCK
-//    6  SPI0 RESET (disp 1)  22  backlight 3 PWM       38  SPI2 RESET
-//    7  roof switch 1        23  fuel sender (A9)      39  SPI2 CS
-//    8  LED strip data       24  rotary dial (A10)     40  IMU SCL
-//    9  SPI0 CS              25  pot 5 (A11)           41  IMU SDA
-//   10  SPI0 DC              26  SPI1 MOSI             42  roof switch 3
-//   11  SPI0 MOSI            27  SPI1 SCK              43  roof switch 4
-//   12  SPI0 TE (reserved)   28  MP3 RX (Serial7)      44  roof switch 5
-//   13  SPI0 SCK             29  MP3 TX (Serial7)      45  roof switch 6
-//   14  pot 1 (A0)           30  CAN3 RX
-//   15  pot 2 (A1)           31  CAN3 TX
+//    0  disp 2 DC   (SPI1 CS0)  16  pot 4 (A2)             32  disp 2 RESET
+//    1  disp 3 TE   (reserved)  17  pot 5 (A3)             33  backlight 2 PWM
+//    2  disp 2 CS               18  FRAM SDA               34  disp 1 TE (reserved)
+//    3  roof switch 2           19  FRAM SCL               35  disp 1 MOSI (SPI2)
+//    4  backlight 3 PWM         20  pot 3 (A6)             36  disp 1 DC   (SPI2 CS0)
+//    5  roof switch 1           21  pot 1 (A7)             37  disp 1 SCK  (SPI2)
+//    6  disp 1 CS               22  fan PWM 2              38  roof switch 6
+//    7  fan PWM 1               23  pot 2 (A9)             39  fan PWM 3
+//    8  LED strip data          24  disp 3 RESET           40  IMU SCL
+//    9  backlight 1 PWM         25  disp 3 CS              41  IMU SDA
+//   10  disp 3 DC   (SPI CS0)   26  disp 2 MOSI (SPI1)     42  roof switch 3
+//   11  disp 3 MOSI (SPI)       27  disp 2 SCK  (SPI1)     43  roof switch 4
+//   12  disp 2 TE   (reserved)  28  MP3 RX (Serial7)       44  roof switch 5
+//   13  disp 3 SCK  (SPI)       29  MP3 TX (Serial7)       45  disp 1 RESET
+//   14  fuel sender (A0)        30  CAN3 RX
+//   15  rotary dial (A1)        31  CAN3 TX
 //
-// Checked Nov 2026 against the KiCad netlist and the Teensy core's MicroMod
-// tables: pins 0-37 sit on the same RT1062 pads as on the Teensy 4.0, so
-// every peripheral the 4.0 design used (LPSPI4/3/1, FlexPWM4 for the
-// backlights, LPUART4 for the strip, LPUART7, FlexCAN3, LPI2C1, the ADC
-// channels) is unchanged. Pins 38/39 swap pads (plain GPIO here - harmless)
-// and pins 40-45 are new. The IMU on 40/41 is not driven by this firmware yet.
+// 31 of these 46 moved with the rev 2 board. What stayed: display 2's bus
+// (0/26/27), the LED strip, both I2C buses, MP3 serial, CAN and roof
+// switches 3-5. Three rules of the hardware constrain any future shuffle:
+//   * the three backlights must share ONE FlexPWM module (backlight.cpp
+//     phase-locks them) - they are all on FlexPWM2;
+//   * the LED strip must sit on a UART TX pin (WS2812Serial);
+//   * each display's DC sits on its SPI bus's hardware CS0 (ILI9341_T4's
+//     fast path needs it).
+// The three TE lines are inputs parked on the SPI MISO pads (1, 12, 34);
+// nothing reads them yet. The IMU on 40/41 is not driven by this firmware
+// yet either.
+//
+// Checked Nov 2026 against the KiCad netlist, the routed PCB and the Teensy
+// core's MicroMod tables (pwm.c, analog.c, SPI.cpp, HardwareSerial7.cpp,
+// WS2812Serial, FlexCAN_T4): every pin carries the peripheral function the
+// code asks of it.
 // ---------------------------------------------------------------------------
 
 #pragma once
@@ -250,12 +261,12 @@ static const uint32_t GAUGE_TX_PERIOD_MS = 100;
 
 // --- analog input pins ----------------------------------------------------------
 
-static const uint8_t PIN_FUEL_SENDER = 23; // A9  - fuel sender divider node
-static const uint8_t PIN_ROTARY      = 24; // A10 - 12-position rotary divider
+static const uint8_t PIN_FUEL_SENDER = 14; // A0 - fuel sender divider node
+static const uint8_t PIN_ROTARY      = 15; // A1 - 12-position rotary divider
 
 // (The four 12V trigger inputs - headlights, brights, blinkers - are gone
-// from the board. Their pins 14-17 now read pots; the lamp states the
-// screens show come from the PDMs over CAN, see LAMP_* below.)
+// from the board. The lamp states the screens show come from the PDMs over
+// CAN, see LAMP_* below.)
 
 // --- ADC configuration ----------------------------------------------------------
 
@@ -269,7 +280,7 @@ static const uint8_t  ADC_AVERAGING       = 16;   // hardware averaging: ~16x le
 //
 //   +3V3 --[R14 150R precision]--+-- FUEL_IN --> 2 x E30 sender in series --> GND
 //                                |
-//                          [R13 2.2k]--+-- FUEL_READ (pin 23)
+//                          [R13 2.2k]--+-- FUEL_READ (pin 14)
 //                                      |
 //                                 [C12 100n]
 //                                      |
@@ -410,7 +421,7 @@ static const uint32_t FUEL_FILL_FULL_MS = 60000;
 //   +3V3 --[R66 4.7k]--+-- DIAL_IN --> wiper --> Rk --> GND
 //                      |
 //                 [C15 100n]      [R67 22k]
-//                      |      +------/\/\/------ DIAL_READ (pin 24)
+//                      |      +------/\/\/------ DIAL_READ (pin 15)
 //                     GND     |
 //                  (DIAL_IN) -+
 //
@@ -534,7 +545,7 @@ static const GaugeMode ROTARY_MODE_MAP[ROTARY_POSITIONS] =
 // PDM's dingoConfig maps bits to outputs (docs/PDM_CAN_SETUP.md).
 
 static const uint8_t ROOF_SWITCH_COUNT = 6;
-static const uint8_t PIN_ROOF_SWITCH[ROOF_SWITCH_COUNT] = { 7, 32, 42, 43, 44, 45 }; // SW1..SW6
+static const uint8_t PIN_ROOF_SWITCH[ROOF_SWITCH_COUNT] = { 5, 3, 42, 43, 44, 38 }; // SW1..SW6
 
 // true = the switch is ON when it closes to ground (pin LOW). Flip an entry
 // for a switch wired the other way round (ON = open), e.g. to make a broken
@@ -564,7 +575,7 @@ static const uint8_t ROOF_SWITCH_DEBOUNCE_TICKS = 3; // 3 x 20 ms = stable for 6
 //   pot 5  co-driver coolshirt pump   -> CAN only (PDM-L PWMs output 14)
 
 static const uint8_t POT_COUNT = 5;
-static const uint8_t PIN_POT[POT_COUNT] = { 14, 15, 16, 17, 25 }; // POT1..POT5 = A0..A3, A11
+static const uint8_t PIN_POT[POT_COUNT] = { 21, 23, 20, 16, 17 }; // POT1..POT5 = A7, A9, A6, A2, A3
 
 static const float POT_PULLUP_OHMS = 4700.0f; // R57/R59/R61/R63/R65
 
@@ -620,12 +631,14 @@ static const float POT_REPORT_STEP    = 1.0f;  // the published percent only mov
 // pwm.kicad_sch has three 2N7002s), the FET inverts the signal - flip
 // FAN_PWM_ACTIVE_HIGH and nothing else.
 //
-// All three are FlexPWM2 (pins 4 and 33 share submodule 0, pin 5 is
-// submodule 1), so one frequency serves all. 25 kHz is the 4-wire fan
-// standard (21-28 kHz) and sits above hearing.
+// Each pin has a timebase to itself: pin 7 is FlexPWM1 submodule 3, pin 22
+// FlexPWM4 submodule 0, pin 39 FlexPWM1 submodule 2. None is shared with
+// another fan or with the backlights (FlexPWM2), so fans.cpp sets the
+// frequency per pin and the 20 kHz backlight timebase is never disturbed.
+// 25 kHz is the 4-wire fan standard (21-28 kHz) and sits above hearing.
 
 static const uint8_t FAN_COUNT = 3;
-static const uint8_t PIN_FAN_PWM[FAN_COUNT] = { 4, 5, 33 }; // PWM1..PWM3
+static const uint8_t PIN_FAN_PWM[FAN_COUNT] = { 7, 22, 39 }; // PWM1..PWM3
 
 // Which pot sets each fan's speed (index into PIN_POT, 0 = pot 1).
 static const uint8_t FAN_POT[FAN_COUNT] = { 0, 1, 2 };
@@ -898,7 +911,8 @@ static const float FUEL_SENDER_VETO_PCT = 25.0f;
 // The module speaks 9600-baud serial on Serial7: pin 29 (TX7 -> module RX)
 // and pin 28 (RX7 <- module TX), per the pinout table ("MP3 Serial TX/RX").
 // It moved off Serial3 (pins 14/15) in the Sept 2026 pin shuffle to free
-// those two analog-capable pins (they read pots 1 and 2 today).
+// those two analog-capable pins (they read the fuel sender and the dial
+// today).
 // Driver in audio.cpp.
 
 static HardwareSerial& AUDIO_SERIAL = Serial7;
@@ -1081,17 +1095,20 @@ static const uint32_t LED_SHIFT_FLASH_HALF_MS = 60;  // ~8 Hz shift light
 // for 0.1 A, so the FET sits deep in its ohmic region and drops millivolts.
 // Ciss ~600 pF / Qg ~6 nC through 470R gives edges of a microsecond or two.
 //
-// PIN TOPOLOGY - why pin 4 became pin 22. The i.MX RT's FlexPWM modules
-// are split into four submodules, each with its own counter and an A/B
-// output pair. Pins 2 and 3 are FlexPWM4 submodule 2, channels A and B;
-// the old pin 4 was FlexPWM2 - a different module, with no way to lock its
-// counter to FlexPWM4's. Pin 22 is FlexPWM4 submodule 0, channel A: same
-// module, and submodule 0 is the one that can broadcast its sync to the
-// others. backlight.cpp slaves submodule 2 to submodule 0's sync, so all
-// three counters run in lockstep and each window can be placed at a chosen
-// phase. (The QuadTimer pins - 10-15, 18, 19 - can't do any of this.)
+// PIN TOPOLOGY - why these three pins. The i.MX RT's FlexPWM modules are
+// split into four submodules, each with its own counter and an A/B output
+// pair, and a counter can only be locked to another submodule of the SAME
+// module. So all three backlights sit on FlexPWM2: pin 9 is submodule 2
+// channel B, pins 33 and 4 are submodule 0 channels B and A. Submodule 0
+// is the one that can broadcast its sync to the others; backlight.cpp
+// slaves submodule 2 to it, so both counters run in lockstep and each
+// window can be placed at a chosen phase. (Before the rev 2 board the
+// backlights were pins 2/3/22 on FlexPWM4, the same arrangement one module
+// over. The QuadTimer pins - 10-15, 18, 19 - can't do any of this.)
+// IF THESE PINS EVER CHANGE, the k_chan table and BL_PWM in backlight.cpp
+// must change with them.
 
-static const uint8_t PIN_BACKLIGHT[3] = { 2, 3, 22 }; // Display 1, 2, 3
+static const uint8_t PIN_BACKLIGHT[3] = { 9, 33, 4 }; // Display 1, 2, 3
 
 // PHASE STAGGER. With analogWrite() every channel's ON window starts at
 // counter zero, so all three FETs switch on in the same nanosecond and the
@@ -1158,7 +1175,8 @@ static const uint32_t BL_FADE_MS = 250;
 
 // --- screens: 3x ER-TFT2.79-1 (NV3007) over SPI ---------------------------------------
 // Each display sits alone on its own SPI bus, so all three DMA uploads can
-// run at the same time. Pin sets follow the pinout table ("SPI0/1/2" blocks).
+// run at the same time. Display 1 is on SPI2, display 2 on SPI1, display 3
+// on SPI (displays 1 and 3 traded buses on the rev 2 board).
 // Note every DC pin is a HARDWARE CS pin of its bus - that is deliberate:
 // the ILI9341_T4 driver toggles DC mid-stream via the SPI peripheral itself
 // (no CPU interrupt per command) only when DC is on a hardware CS pin, and
@@ -1175,9 +1193,9 @@ struct ScreenPins
 
 static const ScreenPins SCREEN_PINS[3] =
     {
-    {  9, 10, 13, 11,  6 }, // display 1 on SPI  (LPSPI4)
-    { 21,  0, 27, 26, 20 }, // display 2 on SPI1 (LPSPI3)
-    { 39, 36, 37, 35, 38 }, // display 3 on SPI2 (LPSPI1, the bottom SD pads)
+    {  6, 36, 37, 35, 45 }, // display 1 on SPI2 (LPSPI1, the SD pads)
+    {  2,  0, 27, 26, 32 }, // display 2 on SPI1 (LPSPI3)
+    { 25, 10, 13, 11, 24 }, // display 3 on SPI  (LPSPI4)
     };
 
 // SPI clock. The NV3007 datasheet rates writes to 100 MHz; the practical
