@@ -24,8 +24,8 @@ lives outside this repository.
 ## Design philosophy
 
 - Most of the time the right amount of attention to pay the gauge is none. 
--  Red: act now, it changes the outcome.
-  Yellow, live: change how you drive or what is switched on. Blue: information. A one-line
+-  Red: The car is about to blow up.
+  Yellow: Start worrying, keep an eye on it. Blue: information. A one-line
   banner names the problem (`OIL LOW`, `PUMP FLT`), critical banners flash
   at 1 Hz, and  have GPWS-style voice callouts
 - Input code establishes what is (temperatures, pressures, link freshness); one alarm table decides what
