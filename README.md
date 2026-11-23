@@ -7,10 +7,9 @@ This is a set of gauges for my BMW E30 rally car, designed to be viewed in the p
 </p>
 
 Three ER-TFT2.79-1 bar displays (NV3007 controller), driven over SPI by a
-SparkFun MicroMod Teensy (it replaced the Teensy 4.0 in Nov 2026; the rev 2
-PCB then moved 31 of the 46 pins - the map is at the top of `src/config.h`),
+SparkFun MicroMod Teensy ,
 fed by CAN data from the rusEFI ECU (a Super uaEFI), the JK BMS and the
-car's two dingoFW PDMs. The gauge also reads the roof switch panel (six
+car's two planned dingoFW PDMs. The gauge also reads the roof switch panel (six
 switches, five pots) and sends it to the PDMs over CAN - it is the car's
 light-switch node - and drives three PWM speed signals for the cabin fans.
 
