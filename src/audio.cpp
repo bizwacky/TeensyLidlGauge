@@ -70,6 +70,7 @@
 static bool     s_dfpReady    = false; // module reported in (or grace expired)
 static uint32_t s_finishAtMs  = 0;     // millis() of the last "track finished" frame
 static uint8_t  s_lastVolSent = 255;   // 255 = unknown -> next clip sends setVolume
+static bool     s_musicError  = false; // an error frame arrived since the last music play
 
 // The library takes the notification hook class as a template parameter and
 // passes the driver object back into every hook, so the type dance goes:
@@ -107,6 +108,7 @@ public:
             case DfMp3_Error_FileMismatch: what = " (track not on SD card)"; break;
             case DfMp3_Error_SdReadFail:   what = " (SD read failed)"; break;
             }
+        s_musicError = true; // if a show track just failed to start, end the show
         Serial.printf("[AUD ] DFPlayer error %u%s\n", code, what);
         }
 
@@ -248,6 +250,14 @@ void audioTick1s()
         s_lastVolSent = AUDIO_VOL_NORMAL;
         }
 
+    // The light show owns the speaker from its countdown to its last note.
+    // Nothing is credited while it does, so alarms still due speak afterwards.
+    if (g_data.show.active)
+        {
+        s_bootNominalPending = false; // no "all systems nominal" after the encore
+        return;
+        }
+
     // (1) has the current clip finished? Trust a "track finished" frame only
     // if it arrived AUDIO_FINISH_GUARD_MS into THIS clip - comparing
     // timestamps (rather than latching a flag) makes stale frames from a
@@ -333,4 +343,41 @@ void audioTick1s()
             }
 
     startClip(clip, candIsRed);
+    }
+
+// --- music for the light show ------------------------------------------------------
+// Three fire-and-forget commands and one question. The volume goes out at
+// the start of the countdown so that, seconds later, the play command is
+// alone on the wire: the time from that command to the first sound is the
+// one number the show's sync depends on (SHOW_AUDIO_LATENCY_MS).
+
+bool audioMusicReady()
+    {
+    return s_dfpReady;
+    }
+
+void audioMusicArm()
+    {
+    sendCmd(Mp3_Commands_SetVolume, SHOW_VOLUME);
+    s_lastVolSent = SHOW_VOLUME; // the next voice clip sees a mismatch and re-sends its own
+    }
+
+void audioMusicPlay(uint16_t file)
+    {
+    sendCmd(Mp3_Commands_PlayMp3FolderTrack, file); // cuts off any clip still speaking
+    s_playingClip = CLIP_NONE;
+    s_playStartMs = millis();
+    s_musicError  = false;
+    Serial.printf("[AUD ] play: show track %u (vol %u)\n", file, SHOW_VOLUME);
+    }
+
+void audioMusicStop()
+    {
+    sendCmd(Mp3_Commands_Stop);
+    }
+
+bool audioMusicFinished()
+    {
+    return s_musicError
+           || (int32_t)(s_finishAtMs - s_playStartMs) >= (int32_t)AUDIO_FINISH_GUARD_MS;
     }

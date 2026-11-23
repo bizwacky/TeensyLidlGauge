@@ -151,8 +151,9 @@ void screensUpdate()
             continue;
             }
 
-        if (debugLayout) gaugeRenderDebug(s_drawFb, i);
-        else             gaugeRenderScreen(s_drawFb, SCREEN_CONTENT[i]);
+        if (g_data.show.active) gaugeRenderShow(s_drawFb, i);
+        else if (debugLayout)   gaugeRenderDebug(s_drawFb, i);
+        else                    gaugeRenderScreen(s_drawFb, SCREEN_CONTENT[i]);
 
         s_tft[i]->update(s_drawFb); // diff + copy + DMA kickoff, returns fast
         }

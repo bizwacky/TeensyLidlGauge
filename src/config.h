@@ -253,6 +253,8 @@ static const uint8_t PDM_FRAME_COUNT = sizeof(PDM_FRAMES) / sizeof(PDM_FRAMES[0]
 // gets is a dingoConfig choice - the gauge always sends both.
 static const uint32_t GAUGE_ID_SWITCHES = 0x4C0; // switches, flags, alive counter
 static const uint32_t GAUGE_ID_POTS     = 0x4C1; // pot positions + fan PWM duty
+static const uint32_t GAUGE_ID_SHOW     = 0x4C2; // light show lamp requests (all zero
+                                                 // unless a show is playing)
 
 // Both frames go out every GAUGE_TX_PERIOD_MS, and at once (next 20 ms tick)
 // when a switch or a pot moves. Set each PDM CAN input's timeout to a few
@@ -500,8 +502,10 @@ enum GaugeMode : uint8_t
                        // hold 60 s = full-tank reset (fuel_calc.cpp)
     MODE_DISPLAYS_OFF, // every LED dark, screens black, backlights off.
                        // Audio alarms STILL play - only the light goes away.
-    MODE_UNASSIGNED,   // spare detents - Darude Sandstorm, fun themes and
-                       // clock-set from the plan land on these one day
+    MODE_LIGHTSHOW,    // the car-park light show: music + every light on the
+                       // car, in time (lightshow.cpp, "light show" below)
+    MODE_UNASSIGNED,   // spare detents - fun themes and clock-set from the
+                       // plan land on these one day
     };
 
 static const GaugeMode ROTARY_MODE_MAP[ROTARY_POSITIONS] =
@@ -515,7 +519,8 @@ static const GaugeMode ROTARY_MODE_MAP[ROTARY_POSITIONS] =
     MODE_DISPLAYS_OFF, // position 6
     MODE_UNASSIGNED,   // position 7
     MODE_UNASSIGNED,   // position 8
-    MODE_UNASSIGNED,   // position 9
+    MODE_LIGHTSHOW,    // position 9: two clicks from any working mode in
+                       // either direction, even on a dial without end stops
     MODE_UNASSIGNED,   // position 10
     MODE_UNASSIGNED,   // position 11
     };
@@ -1285,6 +1290,119 @@ static const uint32_t COL_BRIGHTS_OFF_NIGHT = 0x3C1E00; // TUNE: dim amber
 static const uint32_t COL_BANNER_YELLOW = 0xFFA500; // amber fill, dark text
 static const uint32_t COL_BANNER_RED    = 0xEB232D; // red fill, white text
 // (blue banner fill = COL_INFO_*, green banner fill = COL_SCREEN_GREEN)
+
+// --- light show (lightshow.cpp, lightshow_fx.cpp) ---------------------------------------
+// MODE_LIGHTSHOW: the DFPlayer plays a music track while the LED strip, the
+// three screens and their backlights, and (over CAN, through the PDMs) the
+// car's exterior lamps flash in time with it. For car parks, not stages.
+// How it works, how to add a track and how to calibrate: docs/LIGHTSHOW.md.
+//
+// THE SYNC IS OPEN-LOOP. The DFPlayer reports nothing about where in a track
+// it is, so the gauge starts the track, starts its own clock, and trusts
+// both to run at the same speed. Two numbers line them up, both TUNE ON THE
+// BENCH with the calibration click track (tools/lightshow/make_click_track.py):
+static const int16_t SHOW_AUDIO_LATENCY_MS = 150;  // play command -> first sound. A GUESS:
+                                                   // DFRobot publishes no figure
+static const float   SHOW_TEMPO_TRIM       = 1.0f; // DFPlayer clock speed / ours. Play a file
+                                                   // of known length; the [SHOW] line at the
+                                                   // end prints how long the module took
+
+// When the show may run. It starts only when the dial ARRIVES on the detent
+// (never because the gauge booted there - a brownout mid-show must not loop),
+// after a countdown, and ends at once on any red alarm or when the engine
+// leaves idle: nothing may strobe the headlights on a moving car.
+static const uint32_t SHOW_ARM_MS         = 3000; // the countdown: title on screen, dial still free
+static const uint16_t SHOW_MAX_RPM        = 1500; // idling to hold the battery up is fine
+static const uint32_t SHOW_BOOT_IGNORE_MS = 1000; // a dial position accepted this soon after
+                                                  // boot was not an arrival
+static const uint32_t SHOW_SKIP_WINDOW_MS = 4000; // off the detent and back within this = next
+                                                  // track; longer away = back to track 1
+static const bool     SHOW_AUTO_ADVANCE   = false;// true = play the list on a loop
+
+static const uint8_t  SHOW_VOLUME = 26; // DFPlayer 0..30 (= AUDIO_VOL_RED)
+
+// WS2812 current limit. A full-white strip is 60 mA per LED - 1.6 A for the
+// 27 on the chain - on a 3 A rail that also feeds the backlights and the
+// audio amplifier. Every show frame is scaled down to fit this budget, which
+// is about what the red alarm flash plus the label backlights draw today.
+static const uint16_t SHOW_LED_MAX_MA    = 800;
+static const uint8_t  SHOW_LED_MA_PER_CH = 20; // one colour channel at full
+
+// Fastest strobe on the strip and backlights, in flashes per beat (1, 2 or
+// 4). 4 = sixteenth notes, 9 Hz at 136 bpm - inside the 3-30 Hz band that
+// photosensitive-epilepsy guidance warns about. Set 1 for a public event.
+// (The exterior lamps never exceed one flash per beat per lamp regardless.)
+static const uint8_t SHOW_MAX_FLASH_DIV = 4;
+
+// EXTERIOR LAMPS. One bit per lamp group, sent in GAUGE_ID_SHOW bytes 0-1.
+// The bits do nothing until each PDM output ORs its bit in (the dingoConfig
+// recipe is in docs/PDM_CAN_SETUP.md), so the show can only ever ADD light:
+// the roof switches and the fail-on lamp logic are untouched by it.
+// false = never send a lamp bit, whatever the PDMs are configured to do.
+static const bool SHOW_DRIVE_LAMPS = true;
+
+enum ShowLamp : uint16_t
+    {
+    SHOW_LAMP_LOW      = 1 << 0,  // PDM-L  1 low beam
+    SHOW_LAMP_HIGH     = 1 << 1,  // PDM-L  2 high beam
+    SHOW_LAMP_BAR_SPOT = 1 << 2,  // PDM-L  3 light bar, spot
+    SHOW_LAMP_TURN_L   = 1 << 3,  // PDM-L  4 turn left
+    SHOW_LAMP_TURN_R   = 1 << 4,  // PDM-L  5 turn right
+    SHOW_LAMP_TAIL     = 1 << 5,  // PDM-L  6 tail + plate (running lights)
+    SHOW_LAMP_REVERSE  = 1 << 6,  // PDM-L  7 reverse
+    SHOW_LAMP_YEL_LO   = 1 << 8,  // PDM-E  8 yellow lamps, low
+    SHOW_LAMP_YEL_HI   = 1 << 9,  // PDM-E  9 yellow lamps, high
+    SHOW_LAMP_BAR_WIDE = 1 << 10, // PDM-E 10 light bar, wide
+    SHOW_LAMP_BRAKE    = 1 << 11, // PDM-E 11 brake lights
+    };
+
+// THE TRACK LIST. Track 1 is what the detent plays; the rest are reached by
+// flicking the dial off and back during the countdown. One row per track:
+//
+//   file     the DFPlayer plays /mp3/NNNN*.mp3 (0101 up: clear of the voice clips)
+//   name     shown during the countdown (the banner font: capitals and digits)
+//   bpm      tempo. Must be right to four figures - 0.1 bpm off is a tenth
+//            of a beat after one minute and over a third by the end of 3:45
+//   beat1Ms  where in THE FILE the first downbeat falls (depends on the rip)
+//   seconds  track length: the fallback end if the "finished" frame is lost
+//   map      what the lights do, one letter per 4-bar phrase, repeated if the
+//            track outlasts it:
+//              p pulse   colour flash on every beat          (verse, intro)
+//              c chase   comet on the strip, wig-wag lamps   (groove)
+//              b build   strobe that accelerates; a run of b's is one build,
+//                        and its last beat goes dark         (riser)
+//              d drop    everything, on the beat             (the drop)
+//              k break   slow colour drift, nothing flashes  (breakdown)
+//              - dark
+//            nullptr = SHOW_DEFAULT_MAP, a generic arc that suits most dance
+//            tracks - so a new track needs only its tempo and first beat.
+//
+// tools/lightshow/lightshow_sim.html plays a row against the real audio file
+// and finds bpm and beat1Ms for it.
+struct ShowTrack
+    {
+    uint16_t    file;
+    const char* name;
+    float       bpm;
+    int16_t     beat1Ms;
+    uint16_t    seconds;
+    const char* map;
+    };
+
+static const char* const SHOW_DEFAULT_MAP = "ppccbbddddkkbbdddd";
+
+static const ShowTrack SHOW_TRACKS[] =
+    {
+    // Darude - Sandstorm, radio edit (3:45, 136 bpm). THE MAP AND beat1Ms ARE
+    // PLACEHOLDERS: written from the track's general shape, not measured
+    // against a file. Align them in the simulator before trusting them.
+    { 101, "SANDSTORM", 136.0f, 0, 225, "bbddddccddkkbbddddccddddddccppk-" },
+    // The bench calibration click (tools/lightshow/make_click_track.py).
+    { 100, "CLICK 120", 120.0f, 0,  60, "dddddddd" },
+    };
+static const uint8_t SHOW_TRACK_COUNT = sizeof(SHOW_TRACKS) / sizeof(SHOW_TRACKS[0]);
+
+static const uint8_t SHOW_PHRASE_BEATS = 16; // 4 bars of 4
 
 // --- FRAM: FM24V10 1-Mbit I2C F-RAM ---------------------------------------------------
 // Nonvolatile memory for two jobs: the persistent fuel record (survives the

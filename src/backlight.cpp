@@ -256,6 +256,14 @@ void backlightUpdate()
 
     for (uint8_t i = 0; i < 3; i++)
         {
+        // The light show plays the backlights directly: a strobe must snap,
+        // not ride the fade.
+        if (g_data.show.active)
+            {
+            s_level[i] = (g_data.show.frame.backlight[i] / 255.0f) * BL_TRIM[i];
+            continue;
+            }
+
         const float target = m.displaysOff
                                  ? 0.0f
                                  : (m.screenBrightness / 255.0f) * BL_TRIM[i];

@@ -28,8 +28,9 @@ Everything is 500 kbps, 11-bit ids, little-endian.
 | 0x480-0x4BF | PDM-L (Base ID 0x480) | `PDM_BASE_ID[PDM_L]` |
 | 0x4C0 | gauge: switches, flags, alive counter | `GAUGE_ID_SWITCHES` |
 | 0x4C1 | gauge: pot positions, fan duty | `GAUGE_ID_POTS` |
+| 0x4C2 | gauge: light show lamp requests | `GAUGE_ID_SHOW` |
 
-**These four numbers are placeholders** picked to be clear of every other id
+**These five numbers are placeholders** picked to be clear of every other id
 on the bus (table in `BMS_CAN_SETUP.md`). Replace them with the CAN id
 plan's numbers, in `config.h` and in each box.
 
@@ -83,8 +84,8 @@ the open-load checks (pump, fans: "on and under 2 A") still work.
 
 ## What the gauge sends
 
-Both frames go out every 100 ms, and on the next 20 ms tick whenever their
-content changes.
+All three frames go out every 100 ms, and on the next 20 ms tick whenever
+their content changes.
 
 ### 0x4C0, switches and flags
 
@@ -108,6 +109,77 @@ content changes.
 
 A dingoFW start bit is `byte × 8 + bit`: SW1 ON is start bit 0, SW1 OFF is
 start bit 8, pot 4 is start bit 24 with length 8.
+
+### 0x4C2, light show lamp requests
+
+All zero except while a light show is playing
+([`LIGHTSHOW.md`](LIGHTSHOW.md)). Byte 0 is PDM-L's lamps and byte 1 is
+PDM-E's, so each box reads one byte.
+
+| Byte | Bit | Start bit | Lamp | Output |
+|---|---|---|---|---|
+| 0 | 0 | 0 | low beam | PDM-L 1 |
+| 0 | 1 | 1 | high beam | PDM-L 2 |
+| 0 | 2 | 2 | light bar, spot | PDM-L 3 |
+| 0 | 3 | 3 | turn left | PDM-L 4 |
+| 0 | 4 | 4 | turn right | PDM-L 5 |
+| 0 | 5 | 5 | tail + plate | PDM-L 6 |
+| 0 | 6 | 6 | reverse | PDM-L 7 |
+| 1 | 0 | 8 | yellow lamps, low | PDM-E 8 |
+| 1 | 1 | 9 | yellow lamps, high | PDM-E 9 |
+| 1 | 2 | 10 | light bar, wide | PDM-E 10 |
+| 1 | 3 | 11 | brake lights | PDM-E 11 |
+| 2 | | 16 (length 8) | show state: 0 idle, 1 countdown, 2 playing, 3 over | |
+
+These are plain ON bits with no complement: a show lamp must fail OFF.
+
+## Light show: letting the gauge flash a lamp
+
+Nothing in this section is needed for the car to work. Skip it and the
+show still runs on the gauge's own LEDs and screens.
+
+For each lamp that should join the show, on the box that drives it:
+
+1. Add a CAN input for its bit:
+
+   | Setting | Value |
+   |---|---|
+   | ID | 0x4C2 |
+   | Start Bit | from the table above |
+   | Bit Length | 1 |
+   | Operator / Operand | Equal / 1 |
+   | Mode | Momentary |
+   | Timeout Enabled / Timeout | yes / 500 ms |
+
+2. Make the output's input the lamp's normal request **OR** that CAN
+   input. Where the lamp already has a virtual input for its inverted OFF
+   bit (the recipe below), add the show input to it as a second term with
+   an OR condition.
+
+What this gives:
+
+| Roof switch | Show bit | Gauge alive | Lamp |
+|---|---|---|---|
+| off | 0 | yes | off |
+| off | 1 | yes | **on** |
+| on | either | yes | on |
+| either | either | no | exactly as without a show: fail-on lamps on, show bit timed out to 0 |
+
+The show can add light and cannot remove it, so no state of the show or
+fault in it can darken a lamp the crew has switched on.
+
+Things to settle on the bench, none of them checked:
+
+- **Inrush.** The show restarts a lamp as often as once a beat (2.3 times
+  a second at 136 bpm). Each restart is an inrush event; an output whose
+  inrush limit or time is tight will trip, and the gauge will report `TRP`.
+- **Brake and turn outputs** presumably have their own inputs already
+  (pedal switch, flasher). The show bit is one more OR term on each.
+- **Input budget.** Seven CAN inputs on PDM-L and four on PDM-E, on top of
+  the switch inputs. Count them against what the firmware allows.
+- **The virtual-input fields** (three terms, AND/OR/NOR between them, a
+  NOT per term) are written here from memory of stock dingoPDM, not read
+  from the fork's source. Check them in dingoConfig.
 
 ## Lights fail ON: why every switch is sent twice
 

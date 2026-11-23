@@ -1,0 +1,513 @@
+<title>Lidl Gauge Light Show</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one column - the car and the dash on a dark stage, then the
+   timeline, then the tuning bench. A single night-time look on purpose:
+   the subject is lamps in the dark, so there is no light theme. Colours are
+   the gauge's own (src/config.h): its aubergine panel background, its
+   warning amber, its nominal green, its critical red. */
+:root {
+  color-scheme: dark;
+  --bg: #17121b;
+  --panel: #221a28;
+  --line: #3b2f44;
+  --fg: #ece6ef;
+  --muted: #a898b1;
+  --amber: #ffbe00;
+  --green: #2cff7a;
+  --red: #ff4650;
+  --blue: #4aa3ff;
+  --violet: #a58bea;
+  --display: "Barlow Condensed", "Arial Narrow", sans-serif;
+  --body: "Barlow", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+}
+body { background: var(--bg); color: var(--fg); font: 400 15px/1.5 var(--body); }
+.wrap { max-width: 1080px; margin: 0 auto; padding-block: 20px 48px;
+        padding-left: max(16px, env(safe-area-inset-left, 0px));
+        padding-right: max(16px, env(safe-area-inset-right, 0px));
+        display: flex; flex-direction: column; gap: 18px; }
+h1, h2 { font-family: var(--display); font-weight: 700; text-transform: uppercase;
+         letter-spacing: .06em; margin: 0; text-wrap: balance; }
+h1 { font-size: 30px; line-height: 1.1; }
+h2 { font-size: 15px; color: var(--muted); letter-spacing: .12em; }
+p { margin: 0; max-width: 68ch; }
+.lede { color: var(--muted); }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+button, select, input { font: inherit; color: inherit; }
+button, select, input[type=number], input[type=text] {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
+button { cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--amber); color: #1a1300; border-color: var(--amber);
+                 font-weight: 600; min-width: 5.5em; }
+:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+label { color: var(--muted); font-size: 13px; display: flex; flex-direction: column; gap: 4px; justify-content: flex-end; }
+label.check { flex-direction: row; align-items: center; gap: 8px; color: var(--fg); font-size: 14px; }
+
+/* the stage */
+.stage { background: #0b080d; border: 1px solid var(--line); border-radius: 10px;
+         padding: 14px; display: flex; flex-direction: column; gap: 14px; }
+#car { width: 100%; display: block; aspect-ratio: 1000 / 360; }
+.dash { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+.leds { display: flex; gap: 1.2%; width: min(100%, 620px); justify-content: center; }
+.leds i { flex: 1; aspect-ratio: 1; border-radius: 50%; background: #000; max-width: 22px; }
+.leds i.gap { visibility: hidden; flex: .5; }
+.screens { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; width: min(100%, 760px); }
+.screens div { aspect-ratio: 428 / 142; border-radius: 4px; background: #000;
+               outline: 1px solid #241b2a; position: relative; overflow: hidden; }
+.screens b { position: absolute; inset: 0; }
+.labels { width: min(100%, 420px); }
+.labels i { border-radius: 2px; aspect-ratio: 2.4; max-width: none; }
+.cap { color: var(--muted); font-size: 12px; text-align: center; }
+
+/* transport + timeline */
+.row { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: end; }
+.row > * { min-width: 0; }
+.now { margin-left: auto; text-align: right; font-size: 13px; color: var(--muted); }
+.now strong { color: var(--fg); font-weight: 600; }
+#timeline { position: relative; height: 54px; display: flex; gap: 1px; cursor: pointer;
+            border-radius: 6px; overflow: hidden; user-select: none; touch-action: none; }
+#timeline span { flex: 1; min-width: 0; display: flex; align-items: flex-start; justify-content: center;
+                 font: 600 12px/20px var(--mono); color: #0b080d; position: relative; }
+#timeline span.loop { opacity: .5; }
+#timeline em { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; pointer-events: none; }
+#energy { position: absolute; left: 0; right: 0; bottom: 0; height: 30px; width: 100%; pointer-events: none; }
+.key { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px; color: var(--muted); }
+.key b { font: 600 12px var(--mono); color: #0b080d; padding: 1px 6px; border-radius: 3px; margin-right: 5px; }
+
+/* the bench */
+.bench { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+         padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.grid > * { min-width: 0; }
+input[type=number], input[type=text], select { width: 100%; box-sizing: border-box; }
+#map { font-family: var(--mono); letter-spacing: .08em; }
+pre { margin: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+      padding: 10px 12px; overflow-x: auto; font: 13px/1.5 var(--mono); color: var(--green); }
+.note { font-size: 13px; color: var(--muted); }
+.warn { border-left: 3px solid var(--amber); padding-left: 10px; }
+#msg { min-height: 1.5em; }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Lidl Gauge Light Show</h1>
+    <p class="lede">The firmware's own choreography code, compiled for the browser. What you see here is what <span class="mono">src/lightshow_fx.cpp</span> would send to the LED strip, the three screens and the PDMs.</p>
+  </header>
+
+  <section class="stage" aria-label="The car and the gauge">
+    <canvas id="car" width="1000" height="360" role="img" aria-label="Front and rear of the car with every lamp the show drives"></canvas>
+    <div class="dash">
+      <div class="leds" id="tach"></div>
+      <div class="screens" id="screens"><div><b></b></div><div><b></b></div><div><b></b></div></div>
+      <div class="cap">Tach strip (15 LEDs, reflected in the windscreen) and the three bar displays</div>
+      <div class="leds labels" id="labels"></div>
+      <div class="cap">Switch-label backlights on the end of the same LED chain</div>
+    </div>
+  </section>
+
+  <section class="row" aria-label="Transport">
+    <button class="primary" id="play">Play</button>
+    <label>Track<select id="track"></select></label>
+    <label>Sound<select id="source">
+      <option value="synth">Stand-in beat</option>
+      <option value="file">Your audio file</option>
+    </select></label>
+    <label id="fileLabel" hidden>Audio file (stays on this device)<input type="file" id="file" accept="audio/*"></label>
+    <div class="now mono"><div><strong id="clock">0:00.0</strong> / <span id="total">0:00</span></div>
+      <div>beat <strong id="beat">0</strong> · <strong id="lookName">-</strong> · strip <strong id="ma">0</strong> mA</div></div>
+  </section>
+  <p class="note warn">Playing this flashes the page at up to <span id="hz">9</span> times a second. "Soften flashes" below slows every change down.</p>
+
+  <section aria-label="Timeline">
+    <div id="timeline" role="slider" tabindex="0" aria-label="Position in the track" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><canvas id="energy"></canvas><em id="head"></em></div>
+    <div class="key" id="key"></div>
+  </section>
+
+  <section class="bench" aria-label="Tuning bench">
+    <h2>One row of SHOW_TRACKS</h2>
+    <div class="grid">
+      <label>Tempo, bpm<input type="number" id="bpm" step="0.01" min="40" max="240"></label>
+      <label>First downbeat, ms into the file<input type="number" id="beat1" step="1" min="0" max="30000"></label>
+      <label>Length, s<input type="number" id="seconds" step="1" min="5" max="900"></label>
+      <label>File number on the card<input type="number" id="fileNo" step="1" min="100" max="2999"></label>
+    </div>
+    <label>Map: one letter per four-bar phrase, repeated if the track is longer. Empty = the firmware's default.
+      <input type="text" id="map" spellcheck="false" autocomplete="off" maxlength="500"></label>
+    <div class="row">
+      <button id="find">Find tempo and first beat</button>
+      <button id="suggest">Suggest a map from the audio</button>
+      <button data-nudge="-10">−10 ms</button><button data-nudge="10">+10 ms</button>
+      <button data-beats="-1">−1 beat</button><button data-beats="1">+1 beat</button>
+      <button data-beats="-4">−1 bar</button><button data-beats="4">+1 bar</button>
+    </div>
+    <p class="note" id="msg" role="status"></p>
+    <pre id="rowOut"></pre>
+    <div class="row"><button id="copy">Copy row</button>
+      <span class="note">Paste it into <span class="mono">SHOW_TRACKS</span> in <span class="mono">src/config.h</span>, then re-run <span class="mono">tools/lightshow/build.sh</span>.</span></div>
+
+    <h2>What the car adds</h2>
+    <div class="grid">
+      <label>DFPlayer clock error (the sync is open-loop)<select id="drift">
+        <option value="0">none: calibrated</option><option value="0.001">0.1 % fast</option>
+        <option value="0.003">0.3 % fast</option><option value="0.01">1 % fast</option></select></label>
+      <label class="check"><input type="checkbox" id="lag" checked>Filament lag on bulbs (light bars stay instant)</label>
+      <label class="check"><input type="checkbox" id="soft">Soften flashes</label>
+    </div>
+    <p class="note">The stand-in beat is a drum machine that follows the map, so the timing can be judged without any music. To check a real track, choose "Your audio file": it is decoded in this page and never uploaded.</p>
+  </section>
+</div>
+
+<script>
+/*@ENGINE@*/
+</script>
+<script>
+"use strict";
+const CFG = /*@CONFIG@*/;
+const eng = retasmFunc;
+const $ = id => document.getElementById(id);
+const LOOKS = { p: ['Pulse', '#4aa3ff'], c: ['Chase', '#2cff7a'], b: ['Build', '#ffbe00'],
+                d: ['Drop', '#ff4650'], k: ['Break', '#a58bea'], '-': ['Dark', '#3b2f44'] };
+
+// ---- state -------------------------------------------------------------------
+let ctx = null, gain = null, playing = false, t0 = 0, pausedAt = 0;
+let fileBuf = null, fileNode = null, analysis = null, nextStep = 0, noise = null;
+const lampLevel = {}, ledLevel = [], scrLevel = [0, 0, 0];
+let lastDraw = performance.now();
+
+const row = () => ({ bpm: +$('bpm').value || 120, beat1: +$('beat1').value || 0,
+                     seconds: +$('seconds').value || 60, map: $('map').value });
+const beatMs = () => 60000 / row().bpm;
+const mapOrDefault = () => row().map || CFG.defaultMap;
+const lookAt = beat => { const m = mapOrDefault(); return beat < 0 ? '-' : m[Math.floor(beat / CFG.phraseBeats) % m.length]; };
+const songMs = () => playing ? (ctx.currentTime - (ctx.outputLatency || 0) - t0) * 1000 : pausedAt;
+const fmt = ms => { const s = Math.max(0, ms) / 1000; return Math.floor(s / 60) + ':' + (s % 60).toFixed(1).padStart(4, '0'); };
+
+// ---- the engine --------------------------------------------------------------
+function writeMap() {
+  const mem = new Uint8Array(eng.memory.buffer), p = eng.sim_map(), m = row().map;
+  for (let i = 0; i <= m.length; i++) mem[p + i] = i < m.length ? m.charCodeAt(i) : 0;
+}
+function frameAt(ms) {
+  const r = row(), p = eng.sim_render(r.bpm, r.beat1, Math.round(ms)), v = new DataView(eng.memory.buffer);
+  const f = { led: [], screen: [], backlight: [], lamps: v.getUint16(p + CFG.frame.lamps, true) };
+  for (let i = 0; i < CFG.ledTotal; i++) f.led.push(v.getUint32(p + CFG.frame.led + 4 * i, true));
+  for (let i = 0; i < 3; i++) { f.screen.push(v.getUint32(p + CFG.frame.screen + 4 * i, true));
+                                f.backlight.push(v.getUint8(p + CFG.frame.backlight + i)); }
+  return f;
+}
+
+// ---- drawing -----------------------------------------------------------------
+const tachEls = [], labelEls = [], scrEls = [...document.querySelectorAll('#screens b')];
+for (let i = 0; i < CFG.ledCount; i++) tachEls.push($('tach').appendChild(document.createElement('i')));
+for (let i = CFG.ledCount; i < CFG.ledTotal; i++) labelEls.push($('labels').appendChild(document.createElement('i')));
+tachEls[2].insertAdjacentHTML('afterend', '<i class="gap"></i>');   // status block | tach block
+
+const css = c => `rgb(${c >> 16 & 255},${c >> 8 & 255},${c & 255})`;
+// WS2812s and backlights are linear in duty but the eye is not: lift the low end
+// so a dim LED reads as dim, not as off.
+const lift = c => { const g = x => Math.round(255 * Math.pow((x & 255) / 255, 0.5)); return g(c >> 16) << 16 | g(c >> 8) << 8 | g(c); };
+
+const cv = $('car'), g = cv.getContext('2d');
+function lamp(x, y, w, h, rgb, level, round) {
+  g.globalCompositeOperation = 'source-over';
+  g.fillStyle = '#1c1620'; shape(x, y, w, h, round); g.fill();
+  g.strokeStyle = '#4a3d55'; g.lineWidth = 1.5; g.stroke();
+  if (level < 0.01) return;
+  g.fillStyle = `rgba(${rgb},${Math.min(1, level * 1.2)})`; shape(x, y, w, h, round); g.fill();
+  g.globalCompositeOperation = 'lighter';
+  const r = Math.max(w, h) * 2.1, gr = g.createRadialGradient(x, y, 2, x, y, r);
+  gr.addColorStop(0, `rgba(${rgb},${0.4 * level})`); gr.addColorStop(1, `rgba(${rgb},0)`);
+  g.fillStyle = gr; g.beginPath(); g.arc(x, y, r, 0, 7); g.fill();
+  g.globalCompositeOperation = 'source-over';
+}
+function shape(x, y, w, h, round) {
+  g.beginPath();
+  if (round) g.arc(x, y, w / 2, 0, 7); else g.roundRect(x - w / 2, y - h / 2, w, h, 4);
+}
+function body(ox, rear) {
+  g.fillStyle = '#231c29'; g.strokeStyle = '#4a3d55'; g.lineWidth = 2;
+  g.beginPath(); g.moveTo(ox + 120, 150); g.lineTo(ox + 150, 62); g.lineTo(ox + 330, 62); g.lineTo(ox + 360, 150); g.closePath(); g.fill(); g.stroke();
+  g.fillStyle = '#0e0a11'; g.beginPath(); g.moveTo(ox + 136, 146); g.lineTo(ox + 160, 74); g.lineTo(ox + 320, 74); g.lineTo(ox + 344, 146); g.closePath(); g.fill();
+  g.fillStyle = '#231c29'; g.beginPath(); g.roundRect(ox + 60, 150, 360, 120, 14); g.fill(); g.stroke();
+  g.fillStyle = '#18121d'; g.beginPath(); g.roundRect(ox + 48, 262, 384, 34, 6); g.fill(); g.stroke();
+  g.fillStyle = '#0b080d'; g.fillRect(ox + 78, 296, 56, 30); g.fillRect(ox + 346, 296, 56, 30);
+  g.fillStyle = '#7d6d88'; g.font = '600 15px "Barlow Condensed", sans-serif'; g.textAlign = 'center';
+  g.fillText(rear ? 'REAR' : 'FRONT', ox + 240, 348);
+}
+function drawCar(L, leds) {
+  g.clearRect(0, 0, 1000, 360);
+  // forward light on the ground
+  const fwd = Math.max(L.low, L.high, L.yelLo, L.yelHi, L.barSpot, L.barWide);
+  if (fwd > 0.01) { const gr = g.createRadialGradient(240, 345, 10, 240, 345, 230);
+    gr.addColorStop(0, `rgba(255,244,214,${0.16 * fwd})`); gr.addColorStop(1, 'rgba(255,244,214,0)');
+    g.fillStyle = gr; g.fillRect(0, 100, 480, 260); }
+  body(0, false);
+  for (let i = 0; i < CFG.ledCount; i++) {          // the tach strip, reflected in the screen
+    g.fillStyle = css(lift(leds[i])); g.beginPath(); g.arc(184 + i * 8, 139, 2.4, 0, 7); g.fill(); }
+  g.fillStyle = '#18121d'; g.beginPath(); g.roundRect(222, 196, 16, 30, 5); g.roundRect(242, 196, 16, 30, 5); g.fill();
+  for (let i = 0; i < 8; i++)                        // roof bar: wide pods outside, spot inside
+    lamp(156 + i * 24, 46, 21, 15, '255,250,235', (i < 2 || i > 5) ? L.barWide : L.barSpot);
+  lamp(104, 210, 44, 44, '255,241,214', L.low, true);  lamp(376, 210, 44, 44, '255,241,214', L.low, true);
+  lamp(160, 210, 40, 40, '255,250,240', L.high, true); lamp(320, 210, 40, 40, '255,250,240', L.high, true);
+  lamp(196, 250, 26, 26, '255,208,0', L.yelLo, true);  lamp(284, 250, 26, 26, '255,208,0', L.yelLo, true);
+  lamp(226, 250, 26, 26, '255,224,60', L.yelHi, true); lamp(254, 250, 26, 26, '255,224,60', L.yelHi, true);
+  lamp(76, 279, 40, 14, '255,150,0', L.turnR);         lamp(404, 279, 40, 14, '255,150,0', L.turnL);
+
+  body(520, true);
+  const red = Math.max(L.tail * 0.4, L.brake);        // one red lens: tail dim, brake bright
+  lamp(598, 208, 34, 30, '255,150,0', L.turnL);  lamp(922, 208, 34, 30, '255,150,0', L.turnR);
+  lamp(640, 208, 46, 30, '255,30,40', red);      lamp(880, 208, 46, 30, '255,30,40', red);
+  lamp(686, 208, 34, 30, '255,255,255', L.reverse); lamp(834, 208, 34, 30, '255,255,255', L.reverse);
+  lamp(760, 252, 70, 8, '255,244,214', L.tail * 0.5);  // plate lamp
+}
+
+function drawTimeline() {
+  const r = row(), m = mapOrDefault(), exact = Math.max(0.01, (r.seconds * 1000 - r.beat1) / (beatMs() * CFG.phraseBeats));
+  const tl = $('timeline'), n = Math.min(Math.ceil(exact), 400);
+  tl.querySelectorAll('span').forEach(e => e.remove());
+  for (let i = 0; i < n; i++) {
+    const ch = m[i % m.length], e = document.createElement('span');
+    e.style.background = (LOOKS[ch] || LOOKS.p)[1];
+    if (i === n - 1) e.style.flexGrow = exact - (n - 1);   // the track ends part-way through its last phrase
+    if (i >= m.length) e.className = 'loop';
+    if (n <= 64) e.textContent = ch;
+    tl.insertBefore(e, $('energy'));
+  }
+  // the phrase grid starts at the first downbeat, not at 0: pad the bar to match
+  tl.style.paddingLeft = (100 * r.beat1 / (r.seconds * 1000)) + '%';
+  $('total').textContent = fmt(r.seconds * 1000).slice(0, -2);
+  $('rowOut').textContent = `{ ${$('fileNo').value}, "${$('track').selectedOptions[0].dataset.name || 'NEW TRACK'}", `
+    + `${(+r.bpm).toFixed(Number.isInteger(+r.bpm) ? 1 : 2)}f, ${r.beat1}, ${r.seconds}, ${r.map ? '"' + r.map + '"' : 'nullptr'} },`;
+  $('hz').textContent = (r.bpm / 60 * CFG.maxFlashDiv).toFixed(0);
+  drawEnergy();
+}
+function drawEnergy() {
+  const c = $('energy'), w = c.width = c.clientWidth * devicePixelRatio, h = c.height = 30 * devicePixelRatio, x = c.getContext('2d');
+  x.clearRect(0, 0, w, h);
+  if (!analysis) return;
+  const total = row().seconds * 1000 / analysis.hopMs, peak = analysis.peak || 1;
+  x.fillStyle = 'rgba(11,8,13,.62)';
+  for (let px = 0; px < w; px++) {
+    const a = Math.floor(px / w * total), b = Math.max(a + 1, Math.floor((px + 1) / w * total));
+    let v = 0; for (let i = a; i < b && i < analysis.all.length; i++) v = Math.max(v, analysis.all[i]);
+    x.fillRect(px, h - h * v / peak, 1, h * v / peak);
+  }
+}
+
+function draw() {
+  const now = performance.now(), dt = Math.min(100, now - lastDraw); lastDraw = now;
+  const r = row();
+  let t = songMs();
+  if (playing && t >= r.seconds * 1000) { pause(); pausedAt = 0; t = 0; }
+  const f = frameAt(t * (1 + +$('drift').value));
+  const soft = $('soft').checked;
+  // first-order lag toward a target: tauMs = 0 is instant
+  const ease = (cur, target, tauMs) => tauMs ? cur + (target - cur) * (1 - Math.exp(-dt / tauMs)) : target;
+
+  const L = {};
+  for (const [name, bit] of Object.entries(CFG.lamps)) {
+    const target = f.lamps & bit ? 1 : 0, bar = name.startsWith('bar');
+    // a filament takes roughly 200 ms to reach most of its light; LEDs do not
+    L[name] = lampLevel[name] = ease(lampLevel[name] || 0, target, soft ? 260 : ($('lag').checked && !bar ? 85 : 0));
+  }
+  const leds = f.led.map((c, i) => {
+    const prev = ledLevel[i] || [0, 0, 0], tgt = [c >> 16 & 255, c >> 8 & 255, c & 255];
+    const cur = ledLevel[i] = tgt.map((v, k) => ease(prev[k], v, soft ? 220 : 0));
+    return cur[0] << 16 | cur[1] << 8 | cur[2];
+  });
+  tachEls.forEach((e, i) => { const c = css(lift(leds[i])); e.style.background = c; e.style.boxShadow = leds[i] ? `0 0 10px 1px ${c}` : 'none'; });
+  labelEls.forEach((e, i) => { e.style.background = css(lift(leds[CFG.ledCount + i])); });
+  scrEls.forEach((e, i) => {
+    scrLevel[i] = ease(scrLevel[i], f.backlight[i] / 255, soft ? 220 : 0);
+    e.style.background = css(f.screen[i]); e.style.opacity = Math.pow(scrLevel[i], 0.6).toFixed(3);
+  });
+  drawCar(L, leds);
+
+  const beat = (t - r.beat1) / beatMs(), ch = lookAt(beat);
+  $('clock').textContent = fmt(t);
+  $('beat').textContent = beat < 0 ? '–' : Math.floor(beat) + 1;
+  $('lookName').textContent = (LOOKS[ch] || LOOKS.p)[0];
+  $('ma').textContent = Math.round(f.led.reduce((s, c) => s + (c >> 16 & 255) + (c >> 8 & 255) + (c & 255), 0) * CFG.ledMaPerCh / 255);
+  const pct = 100 * t / (r.seconds * 1000);
+  $('head').style.left = Math.min(100, pct) + '%';
+  $('timeline').setAttribute('aria-valuenow', pct.toFixed(0));
+  if (playing && $('source').value === 'synth') schedule();
+  requestAnimationFrame(draw);
+}
+
+// ---- sound -------------------------------------------------------------------
+function audio() {
+  if (!ctx) { ctx = new (window.AudioContext || window.webkitAudioContext)();
+    gain = ctx.createGain(); gain.gain.value = 0.7; gain.connect(ctx.destination);
+    noise = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+    const d = noise.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1; }
+  return ctx;
+}
+function hit(type, when, level) {      // the stand-in drum machine's three voices
+  const v = ctx.createGain(); v.connect(gain);
+  if (type === 'kick') {
+    const o = ctx.createOscillator(); o.frequency.setValueAtTime(150, when); o.frequency.exponentialRampToValueAtTime(45, when + 0.12);
+    v.gain.setValueAtTime(level, when); v.gain.exponentialRampToValueAtTime(0.001, when + 0.28);
+    o.connect(v); o.start(when); o.stop(when + 0.3);
+  } else if (type === 'pad') {
+    for (const hz of [110, 164.8]) { const o = ctx.createOscillator(); o.type = 'triangle'; o.frequency.value = hz;
+      o.connect(v); o.start(when); o.stop(when + 0.6); }
+    v.gain.setValueAtTime(0.0001, when); v.gain.linearRampToValueAtTime(level * 0.35, when + 0.15); v.gain.linearRampToValueAtTime(0.0001, when + 0.6);
+  } else {
+    const s = ctx.createBufferSource(), flt = ctx.createBiquadFilter(); s.buffer = noise;
+    flt.type = type === 'hat' ? 'highpass' : 'bandpass'; flt.frequency.value = type === 'hat' ? 7000 : 1800;
+    const len = type === 'hat' ? 0.04 : 0.09;
+    v.gain.setValueAtTime(level, when); v.gain.exponentialRampToValueAtTime(0.001, when + len);
+    s.connect(flt); flt.connect(v); s.start(when); s.stop(when + len + 0.02);
+  }
+}
+function schedule() {                  // queue the sixteenth-notes of the next 150 ms
+  const r = row(), step = beatMs() / 4, horizon = (ctx.currentTime - t0) * 1000 + 150;
+  for (; r.beat1 + nextStep * step < horizon; nextStep++) {
+    const when = t0 + (r.beat1 + nextStep * step) / 1000, sub = nextStep % 4, ch = lookAt(nextStep / 4);
+    if (when < ctx.currentTime) continue;
+    if (ch === 'k') { if (sub === 0) hit('pad', when, 1); }
+    else if (ch === 'b') hit('snare', when, 0.25 + 0.55 * ((nextStep / 4 % CFG.phraseBeats) / CFG.phraseBeats));
+    else if (ch !== '-') {
+      if (sub === 0) hit('kick', when, ch === 'd' ? 1 : 0.6);
+      if (sub === 2 && ch !== 'p') hit('hat', when, ch === 'd' ? 0.3 : 0.18);
+    }
+  }
+}
+function play() {
+  audio(); ctx.resume();
+  const from = Math.max(0, pausedAt);
+  if ($('source').value === 'file') {
+    if (!fileBuf) { say('Choose an audio file first, or switch Sound to the stand-in beat.'); return; }
+    fileNode = ctx.createBufferSource(); fileNode.buffer = fileBuf; fileNode.connect(gain);
+    fileNode.start(0, Math.min(from / 1000, fileBuf.duration - 0.05));
+  }
+  t0 = ctx.currentTime - from / 1000;
+  nextStep = Math.max(0, Math.ceil((from - row().beat1) / (beatMs() / 4)));
+  playing = true; $('play').textContent = 'Pause';
+}
+function pause() {
+  if (!playing) return;
+  pausedAt = songMs(); playing = false; $('play').textContent = 'Play';
+  if (fileNode) { try { fileNode.stop(); } catch (e) {} fileNode = null; }
+}
+function seek(ms) {
+  const was = playing; pause();
+  pausedAt = Math.max(0, Math.min(ms, row().seconds * 1000 - 50));
+  if (was) play();
+}
+const say = text => { $('msg').textContent = text; };
+
+// ---- reading a real track ------------------------------------------------------
+// Two loudness curves at 10 ms steps: everything, and only what is below
+// ~150 Hz (the kick and the bass - what "the drop" means to a light show).
+function analyse(buf) {
+  const sr = buf.sampleRate, hop = Math.round(sr * 0.01), n = Math.floor(buf.length / hop);
+  const a = buf.getChannelData(0), b = buf.numberOfChannels > 1 ? buf.getChannelData(1) : a;
+  const low = new Float32Array(n), all = new Float32Array(n), k = 1 - Math.exp(-2 * Math.PI * 150 / sr);
+  let lp = 0, peak = 0;
+  for (let i = 0; i < n; i++) {
+    let el = 0, ea = 0;
+    for (let j = i * hop, e = j + hop; j < e; j++) { const x = (a[j] + b[j]) / 2; lp += k * (x - lp); el += lp * lp; ea += x * x; }
+    low[i] = Math.sqrt(el / hop); all[i] = Math.sqrt(ea / hop); if (all[i] > peak) peak = all[i];
+  }
+  const onset = new Float32Array(n);
+  for (let i = 1; i < n; i++) onset[i] = Math.max(0, low[i] - low[i - 1]);
+  return { low, all, onset, peak, hopMs: hop / sr * 1000 };
+}
+// Lay a beat grid over the kick onsets at every tempo within 6 % of the one
+// in the box and every phase; keep the grid the kicks land on best.
+function findBeat() {
+  if (!analysis) { say('Choose an audio file first: the finder reads the real track.'); return; }
+  const on = analysis.onset, hopMs = analysis.hopMs, guess = row().bpm;
+  const score = (bpm, ph) => { const per = 60000 / bpm / hopMs; let s = 0, k = 0;
+    for (let x = ph; x < on.length - 1; x += per, k++) s += on[Math.round(x)]; return s / Math.max(1, k); };
+  let best = { s: -1 };
+  const sweep = (lo, hi, stepBpm) => { for (let bpm = lo; bpm <= hi; bpm += stepBpm) { const per = 60000 / bpm / hopMs;
+    for (let ph = 0; ph < per; ph++) { const s = score(bpm, ph); if (s > best.s) best = { s, bpm, ph }; } } };
+  sweep(guess * 0.94, guess * 1.06, 0.05);
+  sweep(best.bpm - 0.06, best.bpm + 0.06, 0.004);
+  let bpm = Math.round(best.bpm * 1000) / 1000;
+  const whole = Math.abs(bpm - Math.round(bpm)) < 0.03;      // studio tracks sit on whole tempos
+  if (whole) { bpm = Math.round(bpm); best.s = -1; const b = { s: -1 }; const per = 60000 / bpm / hopMs;
+    for (let ph = 0; ph < per; ph += 0.25) { const s = score(bpm, ph); if (s > b.s) { b.s = s; b.ph = ph; } } best.ph = b.ph; }
+  // the first beat of the grid that actually has a kick on it
+  const per = 60000 / bpm / hopMs, grid = [];
+  for (let x = best.ph; x < on.length - 2; x += per) { const i = Math.round(x); grid.push(Math.max(on[i - 1] || 0, on[i], on[i + 1])); }
+  const typical = [...grid].sort((p, q) => p - q)[Math.floor(grid.length * 0.75)] || 0;
+  const first = Math.max(0, grid.findIndex(v => v >= typical * 0.4));
+  $('bpm').value = bpm; $('beat1').value = Math.round((best.ph + first * per) * hopMs);
+  changed();
+  say(`Found ${bpm} bpm${whole ? ' (snapped to a whole tempo)' : ''}, first kick at ${$('beat1').value} ms. If the lights land between the kicks, nudge by a beat; if phrases start in the wrong bar, nudge by a bar.`);
+}
+// A first draft of the map from how much bass each phrase has.
+function suggestMap() {
+  if (!analysis) { say('Choose an audio file first: the map is drafted from its loudness.'); return; }
+  const r = row(), ph = beatMs() * CFG.phraseBeats / analysis.hopMs, start = r.beat1 / analysis.hopMs, L = [], A = [];
+  for (let p = 0; start + (p + 1) * ph <= analysis.low.length; p++) {
+    let l = 0, a = 0; for (let i = Math.floor(start + p * ph); i < start + (p + 1) * ph; i++) { l += analysis.low[i]; a += analysis.all[i]; }
+    L.push(l / ph); A.push(a / ph);
+  }
+  if (!L.length) { say('The track is shorter than one phrase at this tempo.'); return; }
+  const ref = [...L].sort((p, q) => p - q)[Math.floor(L.length * 0.9)], loud = Math.max(...A);
+  const m = L.map((l, i) => A[i] < loud * 0.06 ? '-' : l > ref * 0.6 ? 'd' : l > ref * 0.3 ? 'c' : 'k');
+  for (let i = 1; i < m.length; i++)            // the quiet phrase before the bass returns is the build
+    if (m[i] === 'd' && m[i - 1] === 'k') { m[i - 1] = 'b'; if (m[i - 2] === 'k' && m[i - 3] === 'k') m[i - 2] = 'b'; }
+  $('map').value = m.join(''); changed();
+  say('Drafted from the bass level of each phrase: d where the bass is full, k where it drops out, b for the phrase before it returns. Check it by ear.');
+}
+
+// ---- wiring --------------------------------------------------------------------
+function changed() {
+  $('map').value = $('map').value.replace(/[^pcbdk-]/gi, '').toLowerCase();
+  writeMap(); drawTimeline();
+  if (playing && $('source').value === 'synth') seek(songMs());   // re-time the drum machine
+}
+function loadTrack() {
+  const t = CFG.tracks[$('track').value] || { file: 100 + CFG.tracks.length + 1, bpm: 128, beat1Ms: 0, seconds: 180, map: null };
+  $('bpm').value = t.bpm; $('beat1').value = t.beat1Ms; $('seconds').value = t.seconds;
+  $('fileNo').value = t.file; $('map').value = t.map || '';
+  pause(); pausedAt = 0; changed();
+  // open on a lit frame: just into the first drop
+  const m = mapOrDefault(), d = Math.max(0, m.indexOf('d'));
+  pausedAt = t.beat1Ms + (d * CFG.phraseBeats + 0.06) * beatMs();
+}
+CFG.tracks.forEach((t, i) => { const o = new Option(t.name, i); o.dataset.name = t.name; $('track').add(o); });
+$('track').add(new Option('New track (default map)', 'new'));
+for (const [ch, [name, col]] of Object.entries(LOOKS))
+  $('key').insertAdjacentHTML('beforeend', `<span><b style="background:${col}">${ch}</b>${name}</span>`);
+
+$('play').onclick = () => playing ? pause() : play();
+$('track').onchange = loadTrack;
+for (const id of ['bpm', 'beat1', 'seconds', 'fileNo', 'map']) $(id).oninput = changed;
+$('source').onchange = () => { pause(); $('fileLabel').hidden = $('source').value !== 'file'; };
+$('find').onclick = findBeat;
+$('suggest').onclick = suggestMap;
+document.querySelectorAll('[data-nudge]').forEach(b => b.onclick = () => { $('beat1').value = Math.max(0, +$('beat1').value + +b.dataset.nudge); changed(); });
+document.querySelectorAll('[data-beats]').forEach(b => b.onclick = () => { $('beat1').value = Math.max(0, Math.round(+$('beat1').value + +b.dataset.beats * beatMs())); changed(); });
+$('file').onchange = async e => {
+  const file = e.target.files[0]; if (!file) return;
+  say('Decoding ' + file.name + ' …');
+  try {
+    fileBuf = await audio().decodeAudioData(await file.arrayBuffer());
+    analysis = analyse(fileBuf);
+    $('seconds').value = Math.round(fileBuf.duration); pause(); pausedAt = 0; changed();
+    say(`Loaded ${file.name}: ${fmt(fileBuf.duration * 1000)}. Set a rough tempo, then "Find tempo and first beat".`);
+  } catch (err) { say('This browser could not decode that file. MP3, WAV and M4A normally work.'); }
+};
+const tl = $('timeline'), toMs = e => { const b = tl.getBoundingClientRect(); return (e.clientX - b.left) / b.width * row().seconds * 1000; };
+tl.onpointerdown = e => { tl.setPointerCapture(e.pointerId); seek(toMs(e)); };
+tl.onpointermove = e => { if (e.buttons) seek(toMs(e)); };
+tl.onkeydown = e => { const d = { ArrowLeft: -1, ArrowRight: 1 }[e.key]; if (d) { seek(songMs() + d * beatMs() * 4); e.preventDefault(); } };
+$('copy').onclick = () => { const text = $('rowOut').textContent;
+  (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject()).then(() => say('Row copied.'),
+    () => { getSelection().selectAllChildren($('rowOut')); say('Row selected: copy it with the keyboard.'); }); };
+addEventListener('resize', drawEnergy);
+if (matchMedia('(prefers-reduced-motion: reduce)').matches) $('soft').checked = true;
+
+loadTrack();
+requestAnimationFrame(draw);
+</script>

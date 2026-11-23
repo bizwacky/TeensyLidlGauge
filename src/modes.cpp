@@ -78,6 +78,9 @@ void modesUpdate()
     //                      domain)
     //   MODE_DEBUG      -> the dense diagnostics pages (screens.cpp picks
     //                      gaugeRenderDebug instead of the gauge layouts)
+    //   MODE_LIGHTSHOW  -> the light show (lightshow.cpp: the countdown,
+    //                      the interlocks and the music clock are state, so
+    //                      they cannot live in this stateless module)
     }
 
 const char* modeName(GaugeMode m)
@@ -91,6 +94,7 @@ const char* modeName(GaugeMode m)
         case MODE_SILENT:       return "SILENT";
         case MODE_FUEL_RESET:   return "FUELRST";
         case MODE_DISPLAYS_OFF: return "DISPOFF";
+        case MODE_LIGHTSHOW:    return "SHOW";
         default:                return "unassigned";
         }
     }

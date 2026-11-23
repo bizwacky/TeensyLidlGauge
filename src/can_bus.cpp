@@ -23,7 +23,9 @@
 //
 // TRANSMITTING. The gauge also talks: the 1 Hz PCS heartbeat for the BMS
 // (canBusTick1s) and, since the roof switch panel moved onto the gauge, the
-// two frames that carry its switches and pots to the PDMs (canBusTick20ms).
+// two frames that carry its switches and pots to the PDMs (canBusTick20ms),
+// plus a third that carries the light show's lamp requests (all zero unless
+// a show is playing).
 // Those two are the car's light switches - their layout is at the bottom of
 // this file and in docs/PDM_CAN_SETUP.md, and it is a contract with each
 // PDM's dingoConfig setup: change one side, change the other.
@@ -423,9 +425,9 @@ void canBusInit()
                   (unsigned long)(RUSEFI_CAN_BASE_ID + RUSEFI_CAN_FRAME_COUNT - 1),
                   (unsigned long)MS_DASH_AFR_TARGET_ID,
                   (unsigned long)BMS_ID_SOC, (unsigned long)BMS_ID_PACK);
-    Serial.printf("      PDM-E base 0x%03lX, PDM-L base 0x%03lX; gauge sends 0x%03lX + 0x%03lX every %lu ms\n",
+    Serial.printf("      PDM-E base 0x%03lX, PDM-L base 0x%03lX; gauge sends 0x%03lX-0x%03lX every %lu ms\n",
                   (unsigned long)PDM_BASE_ID[PDM_E], (unsigned long)PDM_BASE_ID[PDM_L],
-                  (unsigned long)GAUGE_ID_SWITCHES, (unsigned long)GAUGE_ID_POTS,
+                  (unsigned long)GAUGE_ID_SWITCHES, (unsigned long)GAUGE_ID_SHOW,
                   (unsigned long)GAUGE_TX_PERIOD_MS);
     }
 
@@ -534,6 +536,27 @@ void canBusTick20ms()
         memcpy(s_lastPot, b, 8);
         s_lastPotMs = now;
         msg.id = GAUGE_ID_POTS;
+        memcpy(msg.buf, b, 8);
+        s_can.write(msg);
+        }
+
+    // GAUGE_ID_SHOW: the light show's lamp requests. Bytes 0-1 are the
+    // ShowLamp bits (byte 0 = PDM-L's lamps, byte 1 = PDM-E's), byte 2 the
+    // ShowState. All zero unless a show is playing; sent like the two frames
+    // above, so a lamp follows the beat within one tick and a PDM input's
+    // timeout only ever fires when the gauge itself is gone.
+    static uint8_t  s_lastShow[8];
+    static uint32_t s_lastShowMs;
+    memset(b, 0, 8);
+    b[0] = (uint8_t)(g_data.show.frame.lamps & 0xFF);
+    b[1] = (uint8_t)(g_data.show.frame.lamps >> 8);
+    b[2] = g_data.show.state;
+    if (!s_sentOnce || memcmp(b, s_lastShow, 8) != 0
+        || now - s_lastShowMs >= GAUGE_TX_PERIOD_MS)
+        {
+        memcpy(s_lastShow, b, 8);
+        s_lastShowMs = now;
+        msg.id = GAUGE_ID_SHOW;
         memcpy(msg.buf, b, 8);
         s_can.write(msg);
         }

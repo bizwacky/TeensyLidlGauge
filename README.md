@@ -34,7 +34,8 @@ lives outside this repository.
   `--`. Stale data raises no alarms of its own.
 - The rotary dial is the only control: bright,
 - medium, dark (night colours turn every blue element amber, which is kinder
-  to dark-adapted eyes), debug, silent, fuel fill and displays off.
+  to dark-adapted eyes), debug, silent, fuel fill and displays off. One more
+  detent, well away from those, is a car-park light show.
 - All vehicle I/O comes through one sealed 26-pin Superseal. The 12 V front end has reverse-polarity protection, a
   36 V TVS, a switching 5 V module and a separate 3.3 V LDO. The fuel
   record (in CRC'd rotating slots) and a black-box log live in F-RAM, a hardware watchdog resets hung
@@ -155,6 +156,18 @@ given in each footprint's 3D model settings (most are under `Parts/`).
   with per-screen binning trim (`BL_TRIM`) and a 250 ms fade between
   levels. Hardware, frequency and phase rationale in `config.h`; the
   FlexPWM register mechanics and the bench check at the top of the .cpp.
+- `src/lightshow.h/.cpp` - the light show on dial position 9 (prototype,
+  never run on hardware): a music track from the DFPlayer with the LED
+  strip, screens, backlights and - through one more CAN frame to the PDMs -
+  the exterior lamps flashing in time. This file is the state machine: the
+  dial gesture, the countdown, the interlocks (it only starts when the dial
+  arrives there, and a red alarm or an engine above idle ends it) and the
+  open-loop clock that follows the music.
+- `src/lightshow_fx.h/.cpp` - what the lights do at each moment: a pure
+  function from position-in-the-track to one frame, driven by a one-line
+  "map" per track in `config.h`. It is compiled unchanged into the browser
+  simulator and the host tests under `tools/lightshow/`.
+  **See `docs/LIGHTSHOW.md`** for use, calibration, adding a track and limits.
 - `src/watchdog.h/.cpp` - minimal register driver for the i.MX RT's WDOG1.
 - `src/can_bus.h/.cpp` - CAN3 + the decoders: rusEFI's native broadcast
   (frames BASE0..7, layouts from rusEFI's own DBC), the one target-AFR byte
@@ -233,6 +246,11 @@ given in each footprint's 3D model settings (most are under `Parts/`).
   expects**: Base IDs, the status frames decoded (including the proposed
   frames for outputs 9-14), the two frames the gauge sends, the CAN-input
   recipe that makes lamps fail on, and the bench checks.
+- `docs/LIGHTSHOW.md` - the light show: how to use and calibrate it, the
+  SD card layout, how to add a track, and what limits each light source.
+- `tools/lightshow/` - the light show's host tests, its browser simulator
+  (`lightshow_sim.html`, built from the firmware source by `build.sh`) and
+  the calibration click-track generator. Nothing here is flashed.
 - `lib/ILI9341_T4/` - vindar's ILI9341_T4 DMA display library, modified for
   the NV3007 controller. **Read `lib/ILI9341_T4/PORTING_NV3007.md`** for a
   walkthrough of every change and why it was needed. It is vendored from

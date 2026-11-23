@@ -22,6 +22,8 @@
 // after it is ignored) - e.g. CLIP_ALTERNATOR = 6 -> /mp3/0006-alternator.mp3.
 // The folder must be named "mp3" at the card root. Addressing is by filename
 // prefix, so the order files were copied onto the card does not matter.
+// Tracks 0100 and up in the same folder are the light show's music
+// (config.h, SHOW_TRACKS) - never played by the alarm system.
 enum AudioClip : uint8_t
     {
     CLIP_NONE = 0,
@@ -56,3 +58,15 @@ enum AudioClip : uint8_t
 void audioInit();
 void audioLoop();   // every superloop pass: pump DFPlayer notifications
 void audioTick1s(); // arbitration runs on the 1 s tick, per the plan
+
+// --- music for the light show (lightshow.cpp) ---------------------------------
+// The show's tracks live in the same /mp3 folder as the voice clips, as
+// /mp3/0100*.mp3 upward (config.h, SHOW_TRACKS). While g_data.show.active is
+// set the alarm voice stays quiet - a red alarm ends the show first, then
+// speaks; anything yellow that came up during the show speaks after it.
+bool audioMusicReady();             // the module has booted (or its grace period is over)
+void audioMusicArm();               // countdown started: set the music volume
+void audioMusicPlay(uint16_t file); // start /mp3/<file>
+void audioMusicStop();
+bool audioMusicFinished();          // the module reported the end of the track,
+                                    // or an error (e.g. the file is not on the card)

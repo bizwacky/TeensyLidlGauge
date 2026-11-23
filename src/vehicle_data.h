@@ -413,6 +413,38 @@ struct FanData
     uint8_t dutyPct[FAN_COUNT]; // speed being commanded on each PWM pin, 0..100 %
     };
 
+// --- the light show (lightshow.cpp) -------------------------------------------------
+// One frame of the show: what every light the gauge can reach should be
+// doing right now. lightshow_fx.cpp composes it from the music position;
+// the LED strip, screens, backlights and the CAN transmitter each take
+// their part of it while 'active' is set, instead of their normal work.
+
+struct ShowFrame
+    {
+    uint32_t led[LED_TOTAL_COUNT]; // 0xRRGGBB per LED in chain order: the 15 tach
+                                   //  LEDs left to right, then the label backlights
+    uint32_t screen[3];            // 0xRRGGBB: each panel is one flat colour...
+    uint8_t  backlight[3];         // ...whose brightness is its backlight, 0..255
+    uint16_t lamps;                // ShowLamp bits: exterior lamps requested ON
+    };
+
+enum ShowState : uint8_t
+    {
+    SHOW_IDLE = 0, // the dial is somewhere else
+    SHOW_ARMING,   // countdown: title on the screens, nothing playing yet
+    SHOW_PLAYING,
+    SHOW_OVER,     // finished or refused: an ordinary gauge until the dial moves
+    };
+
+struct ShowData
+    {
+    ShowState state;
+    bool      active;    // arming or playing: the show owns the lights this tick
+    uint8_t   track;     // index into SHOW_TRACKS
+    uint8_t   countdown; // whole seconds left while arming
+    ShowFrame frame;
+    };
+
 // --- the last PDM output event, for the black box ----------------------------------
 // pdm.cpp records every change for the worse on any output (a trip, an open
 // load, a fault); fram_log.cpp writes the most recent one into its next
@@ -533,6 +565,7 @@ struct VehicleData
     AlarmsData alarms;
     PdmEventData pdmEvent;
     FramData   fram;
+    ShowData   show;
 
     uint32_t unknownFrameCount; // standard-id CAN frames nothing here expects -
                                 // should sit at 0 on a healthy bus; climbing

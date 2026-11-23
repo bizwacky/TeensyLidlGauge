@@ -74,7 +74,7 @@ other's frames, so the ECU's base address is moved to **0x680 (1664)**; see
 | 0x190-0x19F (+ 29-bit frames) | the ECU's on-board wideband controller |
 | 0x440-0x47F | PDM-E, dingoFW (placeholder base id, see `PDM_CAN_SETUP.md`) |
 | 0x480-0x4BF | PDM-L, dingoFW (placeholder base id) |
-| 0x4C0, 0x4C1 | the gauge (roof switches + pots for the PDMs, placeholder ids) |
+| 0x4C0, 0x4C1, 0x4C2 | the gauge (roof switches, pots and light show lamp requests for the PDMs, placeholder ids) |
 | 0x5E8-0x5EC | rusEFI MS Simplified Broadcast |
 | 0x680-0x68B | rusEFI native broadcast (moved from 0x200) |
 

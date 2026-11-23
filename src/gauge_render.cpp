@@ -557,6 +557,29 @@ void gaugeRenderDebug(uint16_t* fb, uint8_t page)
         }
     }
 
+// --- the light show --------------------------------------------------------------------
+// While a show plays, a panel is a lamp: one flat colour, its brightness
+// done by the backlight. A flat frame diffs to a single run, and the colour
+// only changes on a beat (lightshow_fx.cpp), so the SPI is idle in between.
+// During the countdown the middle panel names the track and the outer two
+// count the seconds down - the only text the show ever draws.
+
+void gaugeRenderShow(uint16_t* fb, uint8_t display)
+    {
+    tgx::Image<tgx::RGB565> im(fb, SCREEN_LX, SCREEN_LY);
+    const ShowData& s = g_data.show;
+
+    im.fillScreen(pack565(s.frame.screen[display < 3 ? display : 0]));
+    if (s.state != SHOW_ARMING) return;
+
+    char digit[4];
+    snprintf(digit, sizeof(digit), "%u", s.countdown);
+    im.drawTextEx(display == 1 ? SHOW_TRACKS[s.track].name : digit,
+                  {SCREEN_LX / 2, SCREEN_LY / 2},
+                  display == 1 ? FONT_BANNER : FONT_VALUE_LG, tgx::Anchor::CENTER,
+                  false, false, pack565(COL_SCREEN_WHITE));
+    }
+
 // --- public entry point --------------------------------------------------------------
 
 void gaugeRenderScreen(uint16_t* fb, ScreenContent content)

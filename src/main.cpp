@@ -37,9 +37,10 @@
 //   every pass : drain the CAN queue, pump DFPlayer notifications, pump the
 //                FRAM write queue + serial console (all cheap when idle)
 //   20 ms tick : poll inputs, PDM verdicts, resolve the dial, mixture window,
-//                fuel calc, fan PWM, alarm state machine, switch/pot frames
-//                to the PDMs, LED tach frame, screens 1-3 (draw + diff +
-//                DMA), backlight PWM, feed the watchdog
+//                fuel calc, fan PWM, alarm state machine, light show,
+//                switch/pot/show frames to the PDMs, LED tach frame,
+//                screens 1-3 (draw + diff + DMA), backlight PWM, feed the
+//                watchdog
 //   1 s tick   : PCS heartbeat, audio arbitration, FRAM fuel record +
 //                black-box log record, debug snapshot
 //
@@ -61,6 +62,7 @@
 #include "fuel_calc.h"
 #include "fans.h"
 #include "alarms.h"
+#include "lightshow.h"
 #include "audio.h"
 #include "led_tach.h"
 #include "screens.h"
@@ -202,6 +204,12 @@ static void debugPrint()
                   g_data.mode.screenBrightness,
                   backlightDutyPct(0), backlightDutyPct(1), backlightDutyPct(2),
                   backlightPhaseLocked() ? "" : " (BL NOT PHASE-LOCKED)");
+    if (g_data.show.state != SHOW_IDLE)
+        {
+        static const char* showStates[] = { "idle", "ARMING", "PLAYING", "over" };
+        Serial.printf("[SHOW] %s \"%s\" lamps=0x%03X\n", showStates[g_data.show.state],
+                      SHOW_TRACKS[g_data.show.track].name, g_data.show.frame.lamps);
+        }
     Serial.printf("[BRD ] cpu=%.1fC clock=", b.cpuTempC);
     if (b.clockValid) Serial.printf("%02u:%02u:%02u\n", b.hh, b.mm, b.ss);
     else              Serial.printf("--:--:-- (RTC not set)\n");
@@ -299,6 +307,7 @@ void loop()
         fuelCalcUpdate(); // burn integration + FUEL FILL gesture -> g_data.fuel
         fansUpdate();     // pots -> cabin fan PWM duty
         alarmsUpdate();   // evaluate the whole warning catalog -> g_data.alarms
+        lightshowUpdate();// the show detent: countdown, music clock -> g_data.show
         canBusTick20ms(); // roof switches + pots -> the PDMs (on change / 10 Hz)
         ledTachUpdate();  // paint the strip from this tick's verdicts (50 Hz)
         screensUpdate();  // compose + diff + DMA-push all three panels

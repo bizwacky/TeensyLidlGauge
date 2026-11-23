@@ -28,3 +28,7 @@ void gaugeRenderScreen(uint16_t* fb, ScreenContent content);
 
 // The MODE_DEBUG dense diagnostics layout, page 0..2 (one per display).
 void gaugeRenderDebug(uint16_t* fb, uint8_t page);
+
+// The light show's frame for display 0..2: one flat colour from
+// g_data.show.frame, plus the track title and countdown while arming.
+void gaugeRenderShow(uint16_t* fb, uint8_t display);

@@ -169,6 +169,19 @@ void ledTachUpdate()
     const AlarmsData& a = g_data.alarms;
     const ModeData&   m = g_data.mode;
 
+    // The light show plays the whole chain, label backlights included - the
+    // one time they are allowed to flash. Its frame arrives finished
+    // (colours and current limit: lightshow_fx.cpp); only the mirror-if-
+    // reversed mapping of the tach LEDs is applied here.
+    if (g_data.show.active)
+        {
+        for (uint8_t i = 0; i < LED_TOTAL_COUNT; i++)
+            s_strip.setPixel((LED_STRIP_REVERSED && i < LED_COUNT) ? LED_COUNT - 1 - i : i,
+                             g_data.show.frame.led[i]);
+        s_strip.show();
+        return;
+        }
+
     // Displays-off mode: one black frame and done - checked before every
     // other rule, so even a red alarm stays dark. Its voice clip still
     // plays; killing the LIGHT is exactly what this detent is for.
