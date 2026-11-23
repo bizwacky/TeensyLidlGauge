@@ -19,48 +19,27 @@ This repository holds the firmware (`src/`, `lib/`, `docs/`) and, in
 enclosure. The full hardware/software plan (`Rally CAN Gauge Project Plan`)
 lives outside this repository.
 
-**Status (Nov 2026):** the v1.0 board is at the ordering stage. It has not
-been built or tested yet, so treat the hardware files as a design under
-review, not a proven board.
+**Status (Nov 2026):** the v1.0 board is at the ordering stage.
 
 ## Design philosophy
 
-- **Peripheral, not focal.** Most of the time the right amount of attention
-  to pay the gauge is none. Green means there is nothing to do; colour
-  carries the urgency, and a voice says the important part so the eyes can
-  stay on the stage.
-- **Urgency has four colours.** Red: act now, it changes the outcome.
-  Yellow, live: change how you drive or what is switched on. Yellow,
-  deferred: nothing to do until the car stops. Blue: information. A one-line
+- Most of the time the right amount of attention to pay the gauge is none. 
+-  Red: act now, it changes the outcome.
+  Yellow, live: change how you drive or what is switched on. Blue: information. A one-line
   banner names the problem (`OIL LOW`, `PUMP FLT`), critical banners flash
-  at 1 Hz, and GPWS-style voice callouts repeat it without talking over
-  each other.
-- **One judge, many messengers.** Input code establishes what *is*
-  (temperatures, pressures, link freshness); one alarm table decides what
-  *matters*; the screens, LEDs and audio only render its verdicts. No
-  display code ever touches a threshold, so the screen can never disagree
-  with the alarm about when "hot" starts. A driver who sees them disagree
-  learns to trust neither.
-- **Absent data looks absent.** A dead sensor or a dropped CAN link draws as
-  `--`, never as a plausible 0 psi (which teaches panic) or a frozen last
-  value (which teaches complacency). Stale data raises no alarms of its own;
-  the link alarms (`NO CAN`, `BATT CAN`) report the staleness instead.
-- **One knob, no menus.** The rotary dial is the only control: bright,
-  medium, dark (night colours turn every blue element amber, which is kinder
-  to dark-adapted eyes), debug, silent, fuel fill and displays off. Anything
-  deeper is a code change on a laptop, not a menu at speed.
-- **Built to survive the car.** All vehicle I/O comes through one sealed
-  26-pin Superseal. The 12 V front end has reverse-polarity protection, a
+  at 1 Hz, and  have GPWS-style voice callouts
+- Input code establishes what is (temperatures, pressures, link freshness); one alarm table decides what
+  matters; the screens, LEDs and audio only render its verdicts. No
+  display code ever touches a threshold. 
+- A dead sensor or a dropped CAN link draws as
+  `--`. Stale data raises no alarms of its own.
+- The rotary dial is the only control: bright,
+- medium, dark (night colours turn every blue element amber, which is kinder
+  to dark-adapted eyes), debug, silent, fuel fill and displays off.
+- All vehicle I/O comes through one sealed 26-pin Superseal. The 12 V front end has reverse-polarity protection, a
   36 V TVS, a switching 5 V module and a separate 3.3 V LDO. The fuel
-  record (in CRC'd rotating slots) and a black-box log live in F-RAM, so
-  the kill switch loses nothing, and a hardware watchdog resets hung
-  firmware within a second. The board is Signal / GND / GND / Signal, so
-  every signal has a solid ground plane next to it.
-- **Made by a fab, swappable where it matters.** The board is laid out for
-  turnkey assembly (JLCPCB and Pikkolo BOMs included); the DFPlayer audio
-  module is the only hand-installed part. The processor is a MicroMod card
-  in an M.2 socket held by one screw, so replacing or upgrading it needs a
-  screwdriver, not a soldering iron.
+  record (in CRC'd rotating slots) and a black-box log live in F-RAM, a hardware watchdog resets hung
+  firmware within a second. 
 
 ## Hardware
 
@@ -70,8 +49,7 @@ review, not a proven board.
 </p>
 
 100 x 100 mm, four layers (Signal / GND / GND / Signal), 1.6 mm, laid out in
-KiCad 10 against JLCPCB's rules and their JLC04161H-7628 stackup (pick that
-stackup when ordering). The J2 pin-out is printed on the back of the board.
+KiCad 10 against JLCPCB's rules and their JLC04161H-7628 stackup. The J2 pin-out is printed on the back of the board.
 
 | Block | Parts |
 |---|---|
@@ -81,7 +59,7 @@ stackup when ordering). The J2 pin-out is printed on the back of the board.
 | CAN | TI TCAN1051HGV-Q1 |
 | Power | Traco TSR 3-2450N (5 V, 3 A), TI TLV75733P (3.3 V LDO), Panjit PJQ4465AP reverse-polarity P-FET, SMCJ36CA TVS |
 | Logging and sensors | 1 Mbit I2C F-RAM (FM24VN10 / FM24V10), ST LSM6DSV320X IMU (±320 g), CR2450 cell for the clock |
-| Audio | DFRobot DFPlayer Mini (DFR0299), hand-installed |
+| Audio | DFRobot DFPlayer Mini (DFR0299)|
 | USB | 6-pin JST-PH (J1) to an Adafruit 6153 panel-mount USB-C, TPD2E2U06 ESD protection |
 
 ### What is in `hardware/`
@@ -99,11 +77,8 @@ stackup when ordering). The J2 pin-out is printed on the back of the board.
 Ordering notes:
 
 - Left off both BOMs on purpose: J3 to J5 (9-pin display breakout headers,
-  do not populate) and H2 to H5 (M3 mounting holes). U7, the DFPlayer Mini,
-  is hand-installed after assembly: it is not on the JLCPCB BOM and is
-  marked that way in the Pikkolo BOM.
-- The Pikkolo BOM marks U3 (IMU), H1 (MicroMod standoff) and BT1 (coin-cell
-  holder) as customer-consigned.
+  do not populate) and H2 to H5 (M3 mounting holes).
+
 
 ### Third-party library files
 
@@ -146,18 +121,7 @@ given in each footprint's 3D model settings (most are under `Parts/`).
   <img src="hardware/Enclosure/on_bar.png" width="49%" alt="Mounted on a 1.75 inch dash bar with two clamps">
 </p>
 
-*Shrimplify, and add lightness.* A rusEFI-style two-piece printed case: a
-tray that carries the PCB and the display bar, and a cover that closes
-around the Superseal with a stepped profile into and in front of the
-connector lip, the way the rusEFI boxes do it. The Superseal faces the
-front of the car; the three displays sit side by side as one wide bar
-facing the driver; USB-C comes out the side through the Adafruit 6153
-bulkhead. The structure grades from industrial isogrid at the connector end
-into organic cells toward the screens ("a ULA rocket morphing into an
-Annihilation creature"), with topology-optimised buttresses carrying the
-display bar. It mounts on a 1.75 in dash bar with two printed clamps, or
-with screws through the dash panel. Candidate materials: PC FR, Liqcreate
-Flame Retardant HDT or PA12-CF (not settled).
+*Shrimplify, and add lightness.*
 
 | File | What |
 |---|---|
