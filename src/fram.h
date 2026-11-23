@@ -15,11 +15,12 @@
 // LEDs. The superloop's cost for a write is a memcpy into the queue (~1 us).
 //
 // THE WRITE QUEUE: only one transfer can own the bus at a time, but one tick
-// may want several writes (log record + head pointer + fuel record). Writes
+// may want several writes (log record + head pointer + fuel record, and the
+// blocks of an impact capture while one is being recorded). Writes
 // are therefore queued - framWriteAsync() copies the payload and returns
 // immediately - and framPump(), called every superloop pass, starts the next
 // transfer whenever the bus is idle. Copying (rather than keeping a pointer)
-// costs 32 bytes of memcpy but means callers can hand over stack variables
+// costs a memcpy of the record but means callers can hand over stack variables
 // and forget them - no "buffer must outlive the transfer" bugs.
 //
 // READS ARE BLOCKING, deliberately: reads only happen at boot (recovering
@@ -62,6 +63,15 @@ bool framRead(uint32_t addr, void* dst, size_t len);
 
 // True when no transfer is running and the queue is empty.
 bool framIdle();
+
+// How many more writes the queue will take right now (0 when the chip is
+// absent). A caller with a lot to write - an impact capture - paces itself
+// on this and leaves room for the once-a-second records.
+uint8_t framQueueFree();
+
+// Queue a write and pump until it is on the chip. Boot and console use only
+// (formatting): it blocks for the transfer, up to 50 ms on a wedged bus.
+bool framWriteSync(uint32_t addr, const void* src, uint8_t len);
 
 // CRC-16/CCITT (poly 0x1021, init 0xFFFF) - the integrity check every record
 // format in fram_log.cpp appends. Lives here so record writers and readers

@@ -78,6 +78,11 @@ void modesUpdate()
     //                      domain)
     //   MODE_DEBUG      -> the dense diagnostics pages (screens.cpp picks
     //                      gaugeRenderDebug instead of the gauge layouts)
+    //   MODE_INCLINOMETER -> the tilt / g-meter pages (screens.cpp picks
+    //                      gaugeRenderMotion)
+    //   MODE_LEVEL_SET  -> the same pages, plus the hold-still-to-zero
+    //                      gesture (motion.cpp: it changes the IMU's
+    //                      calibration, so it belongs to the motion domain)
     }
 
 const char* modeName(GaugeMode m)
@@ -91,6 +96,8 @@ const char* modeName(GaugeMode m)
         case MODE_SILENT:       return "SILENT";
         case MODE_FUEL_RESET:   return "FUELRST";
         case MODE_DISPLAYS_OFF: return "DISPOFF";
+        case MODE_INCLINOMETER: return "INCLINO";
+        case MODE_LEVEL_SET:    return "LEVELSET";
         default:                return "unassigned";
         }
     }

@@ -37,8 +37,8 @@
 //   * each display's DC sits on its SPI bus's hardware CS0 (ILI9341_T4's
 //     fast path needs it).
 // The three TE lines are inputs parked on the SPI MISO pads (1, 12, 34);
-// nothing reads them yet. The IMU on 40/41 is not driven by this firmware
-// yet either.
+// nothing reads them yet. The IMU on 40/41 is the LSM6DSV320X (imu.cpp); its
+// INT1/INT2 pins are not routed, so it is polled through its FIFO.
 //
 // Checked Nov 2026 against the KiCad netlist, the routed PCB and the Teensy
 // core's MicroMod tables (pwm.c, analog.c, SPI.cpp, HardwareSerial7.cpp,
@@ -500,6 +500,13 @@ enum GaugeMode : uint8_t
                        // hold 60 s = full-tank reset (fuel_calc.cpp)
     MODE_DISPLAYS_OFF, // every LED dark, screens black, backlights off.
                        // Audio alarms STILL play - only the light goes away.
+    MODE_INCLINOMETER, // the tilt / g-meter screens: an E30 rolling and
+                       // pitching on the three panels, first-gen 4Runner
+                       // clinometer style (gauge_render.cpp). The warning
+                       // banner still draws.
+    MODE_LEVEL_SET,    // same screens; hold IMU_LEVEL_SET_MS with the car
+                       // parked on level ground to zero roll and pitch
+                       // (motion.cpp, the gesture works like FUEL FILL)
     MODE_UNASSIGNED,   // spare detents - Darude Sandstorm, fun themes and
                        // clock-set from the plan land on these one day
     };
@@ -513,8 +520,8 @@ static const GaugeMode ROTARY_MODE_MAP[ROTARY_POSITIONS] =
     MODE_SILENT,       // position 4
     MODE_FUEL_RESET,   // position 5
     MODE_DISPLAYS_OFF, // position 6
-    MODE_UNASSIGNED,   // position 7
-    MODE_UNASSIGNED,   // position 8
+    MODE_INCLINOMETER, // position 7
+    MODE_LEVEL_SET,    // position 8
     MODE_UNASSIGNED,   // position 9
     MODE_UNASSIGNED,   // position 10
     MODE_UNASSIGNED,   // position 11
@@ -1308,25 +1315,52 @@ static const uint32_t FRAM_SIZE_BYTES  = 131072;  // 128 KB
 // Async write-queue geometry (fram.cpp). Worst case per 1 s tick is three
 // writes (log record + head pointer + fuel record), so depth 8 is generous.
 static const uint8_t  FRAM_QUEUE_DEPTH     = 8;
-static const uint8_t  FRAM_MAX_WRITE       = 40;  // largest single record (the log's)
-static const uint32_t FRAM_XFER_TIMEOUT_MS = 5;   // one 42-byte transfer takes ~0.4 ms;
+static const uint8_t  FRAM_MAX_WRITE       = 64;  // largest single write (an impact
+                                                  // capture's header; the log record is 44)
+static const uint32_t FRAM_XFER_TIMEOUT_MS = 5;   // one 66-byte transfer takes ~0.6 ms;
                                                   // 5 ms of silence = the bus is wedged
 static const uint8_t  FRAM_MAX_CONSEC_ERRS = 8;   // give up (mark chip absent) after this
                                                   // many back-to-back failures
 
-// Memory map. Everything below FRAM_ADDR_LOG is bookkeeping (~1 KB); the
-// rest of the chip - about 127 KB - is the black-box ring.
+// Memory map. Everything below FRAM_ADDR_LOG is bookkeeping (~1 KB). The
+// black-box ring runs from there up to FRAM_ADDR_EVENTS (95 KB); the top
+// 32 KB of the chip holds the impact captures (fram_events.cpp).
 static const uint32_t FRAM_ADDR_HEADER = 0x0000; // 32 B  format marker + geometry
 static const uint32_t FRAM_ADDR_FUEL   = 0x0020; // 16 x 32 B fuel record ring
 static const uint8_t  FRAM_FUEL_SLOTS  = 16;
 static const uint32_t FRAM_ADDR_LOGPTR = 0x0220; // 2 x 16 B log head pointer (ping-pong)
-static const uint32_t FRAM_ADDR_LOG    = 0x0400; // black-box ring, to end of chip
+static const uint32_t FRAM_ADDR_IMUCAL = 0x0240; // 2 x 32 B IMU level calibration (ping-pong)
+static const uint32_t FRAM_ADDR_LOG    = 0x0400; // black-box ring, up to FRAM_ADDR_EVENTS
+
+// IMPACT CAPTURES. A few seconds of high-g waveform around each hard hit,
+// kept in fixed slots of their own so that a rough stage can never eat the
+// black box's depth: the budget is decided here, once, not by how many bumps
+// the car meets. Each slot is 4 KB = one capture (format: fram_events.cpp,
+// docs/FRAM_BLACKBOX.md).
+//
+// THE TRADE. Every slot costs the black box 93 records = 3 min at the
+// nominal cadence, 1.5 min at the alarm cadence. With 8 slots the ring holds
+// 2210 records: 74 min nominal, 37 min if a warning is up the whole time -
+// the "30 minutes before the end of the data" floor with margin. Change the
+// slot count and FRAM_ADDR_EVENTS together (the static_asserts in
+// fram_events.cpp check that the slots end exactly at the top of the chip);
+// either change reformats the chip on the next boot.
+static const uint8_t  FRAM_EVENT_SLOTS      = 8;
+static const uint32_t FRAM_EVENT_SLOT_BYTES = 4096;
+static const uint32_t FRAM_ADDR_EVENTS      = FRAM_SIZE_BYTES - FRAM_EVENT_SLOTS * FRAM_EVENT_SLOT_BYTES; // 0x18000
+
+// Which capture a new one overwrites: the OLDEST, except that the
+// IMU_EVENT_KEEP_BIGGEST hardest hits on the chip are never the victim. So
+// the slots always hold the biggest hits ever recorded plus the most recent
+// ones - the crash is not pushed out by the bumps of the tow home. The
+// keepers stay until the captures are cleared from the serial console.
+static const uint8_t  IMU_EVENT_KEEP_BIGGEST = 2;
 
 // Black-box cadence. Records are written on the 1 s tick while the engine
 // runs (or a real alarm is active - see fram_log.cpp for the gating), every
 // LOG_NOMINAL_EVERY_S seconds normally and every LOG_ALARM_EVERY_S once any
-// yellow/red alarm is up. At 40 B/record the ~127 KB ring holds 3251
-// records: ~1.8 h of nominal running, ~54 min if an alarm is active the
+// yellow/red alarm is up. At 44 B/record the 95 KB ring holds 2210
+// records: ~74 min of nominal running, ~37 min if an alarm is active the
 // whole time. After the engine stops (or the alarm clears) logging continues
 // for LOG_GRACE_MS - the aftermath of a stall is exactly the data you want -
 // then halts so a car left sitting with the ignition on doesn't grind away
@@ -1334,6 +1368,205 @@ static const uint32_t FRAM_ADDR_LOG    = 0x0400; // black-box ring, to end of ch
 static const uint32_t LOG_NOMINAL_EVERY_S = 2;
 static const uint32_t LOG_ALARM_EVERY_S   = 1;
 static const uint32_t LOG_GRACE_MS        = 30000;
+
+// --- IMU: ST LSM6DSV320X ---------------------------------------------------------------
+// Three sensors in one 2.5 x 3 mm package (U3): a +-16 g "low-g"
+// accelerometer, a gyroscope, and a second "high-g" accelerometer that reads
+// to +-320 g - the one for jumps, bashes and crashes. Wiring (KiCad sheet
+// "imu"): I2C on pins 41 (SDA) / 40 (SCL) = the i.MX RT's LPI2C2, with its
+// own 2.2k pull-ups; SA0 grounded -> address 0x6A; CS tied high (I2C mode).
+// INT1 and INT2 are NOT routed, so nothing can wake us: the chip collects
+// samples in its own FIFO and imu.cpp drains it every few milliseconds.
+//
+// Three numbers from the datasheet (DS14623 rev 3) shape the design:
+//   * the high-g channel's zero offset is +-1.5 g (typical!) and its noise
+//     1 mg/rtHz; the low-g channel's are +-12 mg and 0.06 mg/rtHz. So angles
+//     and the g-meter come from the low-g channel, and the high-g channel is
+//     continuously trimmed against it (IMU_HG_TRIM_*);
+//   * the FIFO holds 1.5 KB of samples - about 0.2 s at the rates below;
+//   * the high-g channel only runs while the low-g one is in its
+//     high-performance mode.
+
+static const uint32_t IMU_I2C_HZ   = 1000000; // fast mode plus, the chip's limit. The schematic
+                                              // notes the pull-ups still need checking on the
+                                              // real board: if bus= errors show on the debug
+                                              // line, drop to 400000 (everything still fits)
+static const uint8_t  IMU_I2C_ADDR = 0x6A;    // 110101 + SA0, SA0 strapped low
+static const uint8_t  IMU_WHO_AM_I = 0x73;    // register 0Fh of an LSM6DSV320X
+
+// High-g full scale: 32, 64, 128, 256 or 320 (g). Resolution scales with it
+// (1 to 10.4 mg per count - never the limit; the channel's noise is ~20 mg
+// rms). 320 is the reason this part is on the board.
+static const uint16_t IMU_HG_FULL_SCALE_G = 320;
+
+// Sample rates. FIXED by register codes in imu.cpp (ODR_XL_HG = 960 Hz,
+// ODR_XL = ODR_G = 120 Hz, the same batch rates into the FIFO): these two
+// constants are the arithmetic's copy of them, not knobs. 960 Hz puts a
+// 50 ms crash pulse on 48 samples; 120 Hz is plenty for attitude.
+static const uint16_t IMU_HG_RATE_HZ = 960;
+static const uint16_t IMU_LG_RATE_HZ = 120;
+
+// FIFO draining. Every IMU_POLL_MS the driver asks how many words wait
+// (about six) and reads them in one burst. A burst is capped at 36 words:
+// 252 bytes, the most one I2C read can carry (the peripheral's 256-byte
+// limit). If the debug line's tag= counter ever climbs, the chip is not
+// wrapping its FIFO address the way ST's application notes describe - set
+// IMU_FIFO_BURST_WORDS to 1 and every word is fetched on its own.
+static const uint32_t IMU_POLL_MS          = 5;
+static const uint8_t  IMU_FIFO_BURST_WORDS = 36;
+static const uint32_t IMU_XFER_TIMEOUT_MS  = 10;   // a full burst takes 2.5 ms at 1 MHz
+static const uint8_t  IMU_MAX_CONSEC_ERRS  = 8;    // back-to-back failures before standing down
+static const uint32_t IMU_SETTLE_MS        = 150;  // samples dropped after (re)start: the
+                                                   // gyroscope's turn-on time is 40 ms
+static const uint32_t IMU_FRESH_MS         = 250;  // no samples for this long = data is stale
+static const uint32_t IMU_STALL_MS         = 500;  // ...for this long = reconfigure the chip
+static const uint32_t IMU_RETRY_MS         = 5000; // how often a missing/stalled chip is retried
+                                                   // (a retry blocks the loop for ~10 ms)
+
+// MOUNTING: which way the sensor's axes point in the car. The vehicle frame
+// used everywhere is X forward, Y left, Z up.
+//
+// From the datasheet's figure 5 and the PCB: U3 sits on the front copper,
+// rotated -90 degrees, which puts sensor +X toward the board's display edge
+// and sensor +Y toward the board's right edge (front side up, J2 at the
+// top), +Z out of the front side. The enclosure renders show the board
+// lying flat, front side up, J2 toward the front of the car and the
+// displays toward the driver. Hence:
+//
+//      forward = -X      left = -Y      up = +Z
+//
+// CHECK ON THE BENCH before trusting any of it (docs/IMU_SETUP.md has the
+// procedure): the debug line prints the three vehicle-frame values, and
+// tipping the gauge's nose up must raise "lon", tipping its right side down
+// must raise "lat". The three entries must form a right-handed set
+// (forward x left = up); imu.cpp checks and complains at boot if not.
+//
+// This map only has to be right to the nearest axis. The exact angle - the
+// gauge sits wherever its clamps were tightened on a round bar - is taken
+// out by the LEVEL SET gesture below.
+enum ImuAxis : uint8_t
+    {
+    IMU_AXIS_POS_X = 0, IMU_AXIS_NEG_X,
+    IMU_AXIS_POS_Y,     IMU_AXIS_NEG_Y,
+    IMU_AXIS_POS_Z,     IMU_AXIS_NEG_Z,
+    };
+
+static const ImuAxis IMU_AXIS_FORWARD = IMU_AXIS_NEG_X;
+static const ImuAxis IMU_AXIS_LEFT    = IMU_AXIS_NEG_Y;
+static const ImuAxis IMU_AXIS_UP      = IMU_AXIS_POS_Z;
+
+// LEVEL SET: park on level ground, turn the dial to the LEVEL SET detent and
+// keep the car still for this long. The gravity direction measured over the
+// hold becomes "level" (stored in the FRAM, so it survives the kill switch).
+// Visiting the detent also clears the g-meter's maxima.
+static const uint32_t IMU_LEVEL_SET_MS = 5000;
+
+// "Still" - nothing is moving, so the gyroscope's zero can be learned and a
+// level set may proceed: the acceleration is 1 g to within STILL_ACC_G, the
+// gyroscope is steady to within STILL_GYRO_DPS of its own short average,
+// and the engine (if the ECU is talking) is below STILL_MAX_RPM - a long
+// constant-radius corner on smooth tarmac can otherwise look still.
+static const float    IMU_STILL_ACC_G      = 0.04f;
+static const float    IMU_STILL_GYRO_DPS   = 1.5f;
+static const float    IMU_STILL_MAX_DPS    = 6.0f;  // a "zero" bigger than this is not a zero
+static const uint16_t IMU_STILL_MAX_RPM    = 1500;
+static const uint32_t IMU_STILL_MS         = 1500;  // ...all of it for this long
+static const float    IMU_GYRO_BIAS_TAU_S  = 4.0f;  // how fast the learned zero follows
+
+// ATTITUDE (roll and pitch) is the gyroscope integrated, pulled slowly toward
+// where the accelerometer says "down" is. The pull has time constant
+// IMU_ATT_TAU_S and only acts while the total acceleration is within
+// IMU_ATT_GATE_G of 1 g - during cornering, braking and landings "down"
+// as the accelerometer feels it is a lie, and the gyro carries the estimate.
+// Honest limits: a sustained gentle corner (under the gate) still leaks in,
+// so at stage pace expect errors of several degrees. Parked or crawling it
+// is good to about a degree. TUNE: a longer tau trusts the gyro more.
+static const float IMU_ATT_TAU_S  = 3.0f;
+static const float IMU_ATT_GATE_G = 0.10f;
+
+// Smoothing of the g-meter values (low-g channel). Display nicety: 0.1 s
+// keeps cornering and braking, drops the engine's shake.
+static const float IMU_G_FILTER_TAU_S = 0.10f;
+
+// HIGH-G TRIM. The high-g channel's offset (+-1.5 g typical) is measured
+// against the low-g channel whenever both can see the same thing - every
+// axis under IMU_HG_TRIM_MAX_G - and averaged over IMU_HG_TRIM_TAU_S. A
+// trimmed high-g channel reads 1.00 g at rest like the low-g one.
+static const float IMU_HG_TRIM_TAU_S = 5.0f;
+static const float IMU_HG_TRIM_MAX_G = 8.0f;
+
+// PEAK HOLD. What goes out on CAN is not "the acceleration now" but the
+// largest one in the last IMU_PEAK_BINS x IMU_PEAK_BIN_SAMPLES samples
+// (5 x 40 at 960 Hz = 0.21 s). A landing spike lasts milliseconds and the
+// ECU's SD log samples at 20-100 Hz. With the hold a hit is on the bus in at
+// least three consecutive 40 ms frames, so any log rate of 10 Hz or more
+// sees every peak at its full height. The price is 0.2 s of smear in WHEN.
+static const uint8_t IMU_PEAK_BIN_SAMPLES = 40;
+static const uint8_t IMU_PEAK_BINS        = 5;
+
+// JUMPS. Airborne = total acceleration under IMU_AIR_G (free fall reads 0 g;
+// drag and rotation keep it from being exactly that). Shorter than
+// IMU_AIR_MIN_MS is a crest, not a jump. The landing is the largest hit in
+// the IMU_LAND_WINDOW_MS after the wheels come back.
+// TUNE all three from the first stage's log.
+static const float    IMU_AIR_G          = 0.35f;
+static const uint16_t IMU_AIR_MIN_MS     = 150;
+static const uint16_t IMU_LAND_WINDOW_MS = 500;
+
+// IMPACT CAPTURES. A capture starts when the trimmed high-g magnitude stays
+// at or above IMU_EVENT_TRIGGER_G for IMU_EVENT_MIN_SAMPLES samples in a row
+// (two = 2 ms: a single wild sample is not an impact). It keeps
+// IMU_EVENT_PRE_BLOCKS of what came BEFORE the trigger and runs to
+// IMU_EVENT_BLOCKS in all:
+//
+//   one frame  = IMU_EVENT_DECIM high-g samples (4 -> 240 frames/s); per
+//                axis, the sample with the largest size, so a decimated
+//                trace keeps every peak
+//   one block  = IMU_EVENT_BLOCK_FRAMES frames (12 = 50 ms) + roll, pitch
+//                and yaw rate at its end
+//   one capture = 100 blocks = 5 s: 1 s before the trigger, 4 s after
+//
+// TRIGGER LEVEL IS A GUESS (6 g): nobody has measured what this dash bar
+// sees on a stage. TUNE it from the first event's SD log - the peak-hold
+// channel shows every hit - so that it fires a handful of times a stage.
+// Too low costs nothing but slots of bumps; the biggest hits are kept
+// regardless (IMU_EVENT_KEEP_BIGGEST).
+static const float   IMU_EVENT_TRIGGER_G    = 6.0f;
+static const uint8_t IMU_EVENT_MIN_SAMPLES  = 2;
+static const uint8_t IMU_EVENT_DECIM        = 4;
+static const uint8_t IMU_EVENT_BLOCK_FRAMES = 12;
+static const uint8_t IMU_EVENT_PRE_BLOCKS   = 20;
+static const uint8_t IMU_EVENT_BLOCKS       = 100;
+
+// Delta-v - the change in the car's velocity that a hit made, the usual
+// measure of how hard a crash was - is the acceleration with gravity taken
+// out, summed over time while the total is above this level. The gate keeps
+// sensor offset and ordinary driving from adding up between hits; it must
+// not exceed the trigger level.
+static const float IMU_EVENT_DV_GATE_G = 2.0f;
+
+// --- IMU on CAN ------------------------------------------------------------------------
+// Four frames, little-endian like everything else here. Layouts at the
+// bottom of can_bus.cpp and in docs/IMU_SETUP.md; docs/rusefi_imu.lua is
+// the rusEFI script that puts them in the ECU's SD log.
+//
+// THE IDS ARE CHOSEN TO LOSE. CAN arbitration goes to the LOWER id, so this
+// block sits above every id that matters on this bus: the BMS, the wideband,
+// both PDMs, the gauge's own switch frames, the MS dash frames and the
+// ECU's broadcast at 0x680-0x68B. Whenever one of those wants the wire at
+// the same moment, the IMU frame waits. (Only the BMS's 1 Hz version and
+// statistics frames at 0x700/0x750 rank lower.) It stays clear of the
+// OBD-II ids at 0x7DF-0x7EF.
+static const uint32_t IMU_CAN_BASE_ID     = 0x6A0;
+static const uint32_t IMU_CAN_ID_IMPACT   = IMU_CAN_BASE_ID + 0; // peak-held high-g
+static const uint32_t IMU_CAN_ID_MOTION   = IMU_CAN_BASE_ID + 1; // low-g + yaw rate
+static const uint32_t IMU_CAN_ID_ATTITUDE = IMU_CAN_BASE_ID + 2; // roll, pitch, jumps, status
+static const uint32_t IMU_CAN_ID_EVENT    = IMU_CAN_BASE_ID + 3; // last impact capture
+
+// 25 + 25 + 10 + 5 = 65 frames/s, about 1.6 % of the 500 kbps bus.
+static const uint32_t IMU_CAN_FAST_MS     = 40;  // impact + motion frames
+static const uint32_t IMU_CAN_ATTITUDE_MS = 100;
+static const uint32_t IMU_CAN_EVENT_MS    = 200;
 
 // --- watchdog -------------------------------------------------------------------------
 // Hardware watchdog timeout. The 20 ms tick feeds it; if the firmware ever

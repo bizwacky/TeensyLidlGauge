@@ -223,6 +223,24 @@ bool framIdle()
     return s_qCount == 0 && !s_inFlight;
     }
 
+uint8_t framQueueFree()
+    {
+    return g_data.fram.present ? (uint8_t)(FRAM_QUEUE_DEPTH - s_qCount) : 0;
+    }
+
+bool framWriteSync(uint32_t addr, const void* src, uint8_t len)
+    {
+    if (!framWriteAsync(addr, src, len))
+        return false;
+    elapsedMillis guard;
+    while (!framIdle())
+        {
+        framPump();
+        if (guard > 50) return false;
+        }
+    return true;
+    }
+
 uint16_t framCrc16(const void* data, size_t len)
     {
     // CRC-16/CCITT, bit-at-a-time. A lookup table would be 16x faster but

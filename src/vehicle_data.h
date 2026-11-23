@@ -4,7 +4,8 @@
 // One global struct, g_data, is the single source of truth for everything the
 // gauge knows about the car. The dataflow is strictly one-way:
 //
-//     input modules (can_bus, inputs)  --write-->  g_data  --read-->  consumers
+//     input modules (can_bus, inputs,  --write-->  g_data  --read-->  consumers
+//                    imu + motion)
 //                                                            (alarms, audio,
 //                                                             screens, LED tach,
 //                                                             FRAM log, fan PWM,
@@ -430,6 +431,93 @@ struct PdmEventData
     uint16_t count;    // events since boot
     };
 
+// --- IMU: motion, attitude, impacts ------------------------------------------------
+// From the LSM6DSV320X (imu.cpp drains its FIFO; motion.cpp turns samples
+// into everything below). The vehicle frame is X forward, Y left, Z up, and
+// every acceleration is what an accelerometer feels ("specific force"), in
+// g: parked on level ground the car reads lon 0, lat 0, vert +1.
+//
+//   lon   + = speeding up        - = braking
+//   lat   + = turning left       - = turning right
+//   vert  + = pressed into the seat (1 at rest, 0 in free fall)
+//   roll  + = right side down    pitch + = nose up    yaw rate + = to the left
+//
+// Two families of acceleration values: the SMOOTH ones (lonG...) come from
+// the low-g channel and are for the g-meter; the PEAK ones (peakG...) come
+// from the high-g channel and hold the largest reading of the last 0.2 s,
+// which is what makes a millisecond-long hit loggable (config.h, PEAK HOLD).
+
+// Summary of an impact capture: the one being recorded, else the last one.
+struct ImuEventData
+    {
+    uint32_t id;         // 0 = none yet. Counts on from the newest capture in
+                         //  the FRAM, so ids are unique across power cycles
+    bool     active;     // its window is still running: the numbers below
+                         //  can still grow
+    float    peakG;      // largest total acceleration in the capture
+    float    peakLonG;   // per axis: the reading of largest size, with its sign
+    float    peakLatG;
+    float    peakVertG;
+    float    dvLonMps;   // delta-v, m/s: what the hit changed the car's speed by
+    float    dvLatMps;
+    float    dvVertMps;
+    uint16_t overMs;     // time spent at or above the trigger level
+    uint16_t airMs;      // air time that ended in this hit (0 = not a landing)
+    };
+
+struct ImuData
+    {
+    // -- the chip (imu.cpp) --
+    bool     present;       // answered WHO_AM_I and took its configuration
+    uint32_t lastDataMs;    // millis() of the last sample batch (0 = never)
+    uint32_t hgSamples;     // high-g samples received since boot
+    float    hgRateHz;      // measured over the last second: should read ~960
+    uint32_t busErrors;     // failed I2C transfers - should sit at 0
+    uint32_t fifoOverruns;  // times the chip's FIFO filled before we drained it
+                            //  (samples lost) - should sit at 0
+    uint32_t tagErrors;     // FIFO words with a tag nothing here expects
+    uint16_t fifoPeakWords; // deepest the FIFO has been found since the last
+                            //  debug print (it holds about 256)
+
+    // -- calibration (motion.cpp) --
+    bool  levelCal;         // a LEVEL SET has been done (else roll and pitch
+                            //  include the gauge's mounting angle)
+    bool  hgTrimmed;        // the high-g offset trim has settled
+    float hgOffsetG[3];     // that trim, sensor axes X/Y/Z, g
+
+    // -- smooth motion, low-g channel + gyro --
+    float lonG, latG, vertG;
+    float rollDeg, pitchDeg;
+    float yawRateDps;
+    bool  still;            // nothing is moving (gyro zero is being learned)
+
+    // -- g-meter maxima since the LEVEL SET detent was last visited --
+    float maxAccelG, maxBrakeG, maxLeftG, maxRightG;
+
+    // -- peak-held impact channel, high-g --
+    float peakG;            // largest total acceleration of the last 0.2 s
+    float peakLonG;         // per axis: the reading of largest size in the
+    float peakLatG;         //  same 0.2 s, with its sign
+    float peakVertG;
+    float maxPeakG;         // largest total acceleration since the LEVEL SET
+                            //  detent was last visited
+
+    // -- jumps --
+    bool     airborne;      // in free fall right now
+    uint16_t jumpCount;     // jumps since boot
+    uint16_t lastAirMs;     // air time of the last one
+    float    lastLandG;     // its landing: largest total acceleration
+
+    // -- impact captures --
+    ImuEventData event;
+
+    // -- the LEVEL SET gesture (published for the screens) --
+    bool    levelSetActive;   // dial is on the LEVEL SET detent
+    bool    levelSetWaiting;  // ...but the car is moving (or the IMU is down)
+    uint8_t levelSetPct;      // hold progress, 0..100
+    bool    levelSetDone;     // captured during this visit
+    };
+
 // --- the warning/alarm system --------------------------------------------------------
 // The alarm catalogue: the project plan's "Text warnings" list, re-ordered
 // and extended with the PDM rows by the Nov 2026 alarm structure
@@ -533,6 +621,7 @@ struct VehicleData
     AlarmsData alarms;
     PdmEventData pdmEvent;
     FramData   fram;
+    ImuData    imu;
 
     uint32_t unknownFrameCount; // standard-id CAN frames nothing here expects -
                                 // should sit at 0 on a healthy bus; climbing
@@ -553,6 +642,10 @@ struct VehicleData
     bool pdmFrameFresh(uint8_t pdm, uint8_t row) const; // that status frame is arriving
     bool pdmFrameSeen(uint8_t pdm, uint8_t row) const;  // ...has arrived at least once
     bool pdmOnline(uint8_t pdm) const; // every frame the box owes us is fresh
+
+    // The IMU is configured and samples arrived within IMU_FRESH_MS. Every
+    // consumer of g_data.imu asks this first: stale motion data draws as "--".
+    bool imuOnline() const;
     };
 
 // Short name of an ECU frame for debug prints ("BASE4", "MS-AFRTGT").

@@ -141,7 +141,8 @@ void screensUpdate()
     for (uint8_t i = 0; i < 3; i++) s_blackDone[i] = false;
 
     const uint32_t t0 = micros();
-    const bool debugLayout = (m.mode == MODE_DEBUG);
+    const bool debugLayout  = (m.mode == MODE_DEBUG);
+    const bool motionLayout = (m.mode == MODE_INCLINOMETER || m.mode == MODE_LEVEL_SET);
 
     for (uint8_t i = 0; i < 3; i++)
         {
@@ -151,8 +152,9 @@ void screensUpdate()
             continue;
             }
 
-        if (debugLayout) gaugeRenderDebug(s_drawFb, i);
-        else             gaugeRenderScreen(s_drawFb, SCREEN_CONTENT[i]);
+        if (debugLayout)       gaugeRenderDebug(s_drawFb, i);
+        else if (motionLayout) gaugeRenderMotion(s_drawFb, i, SCREEN_CONTENT[i] == SCREEN_OIL_VOLTS);
+        else                   gaugeRenderScreen(s_drawFb, SCREEN_CONTENT[i]);
 
         s_tft[i]->update(s_drawFb); // diff + copy + DMA kickoff, returns fast
         }

@@ -14,6 +14,10 @@ This file is the contract between the ECU configuration and the firmware:
 **if you change anything in TunerStudio, update this file and
 `src/config.h` / `src/can_bus.cpp` to match.**
 
+One optional thing does go on the ECU: a short Lua script that records the
+gauge's IMU in the ECU's SD card log. It is separate from everything below;
+see `IMU_SETUP.md` and `rusefi_imu.lua`.
+
 Everything below was checked against rusEFI's source (master, Nov 2026), the
 most reliable documentation there is:
 
@@ -124,6 +128,7 @@ target from them.
 | wideband, BMS, gauge heartbeat | a few hundred | a few % |
 | two PDMs (5-11 status frames each, every 100 ms) | 100-220 | ~3-6 % |
 | gauge switch + pot frames (10 Hz, more while a knob turns) | ~20 | under 1 % |
+| gauge IMU frames (0x6A0-0x6A3) | 65 | ~1.6 % |
 
 That's comfortably under the ~50 % where CAN gets crowded. The MS broadcast
 is the expensive part, and it exists here for one byte. If bus load ever

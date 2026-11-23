@@ -8,6 +8,7 @@
 //   4. drawing primitives ported from the PC prototype (icons, bars, lambda)
 //   5. the three gauge layouts
 //   6. the MODE_DEBUG dense layout
+//   7. the motion pages: inclinometer + g-meter
 //
 // THE DESIGN, IN THREE RULES:
 //
@@ -554,6 +555,328 @@ void gaugeRenderDebug(uint16_t* fb, uint8_t page)
             debugRow(im, t, 3, line);
             break;
             }
+        }
+    }
+
+// --- 7. the motion pages: inclinometer + g-meter ------------------------------------
+// MODE_INCLINOMETER (and MODE_LEVEL_SET, which adds its hold progress): the
+// dash-top clinometer of a first-generation 4Runner, with the right car in
+// it. Three pages, one per panel, each keeping the usual skeleton - picture
+// on the left 256 px, label + number + a text box on the right - so the
+// warning banner still has its box on the panel it normally lives on:
+//
+//   page 0  ROLL    the E30 from behind, leaning against a fixed scale
+//   page 1  PITCH   the E30 from the side, nose rising and falling
+//   page 2  G       a g-meter: where the loose ball on the dash would be
+//
+// The cars are LINE DRAWINGS on purpose. A rotating picture changes every
+// frame; an outline changes only the pixels its lines cross, so the
+// differential upload stays a few kilobytes where a filled silhouette would
+// re-send most of the panel. Each drawing is a list of points in its own
+// little coordinate system (pixels, x right, y DOWN, origin where it turns)
+// and a Pose puts it on the glass, turned.
+//
+// No thresholds here either: nothing on these pages changes color with its
+// value. They are for looking at, and the alarm system has no rows for g.
+
+struct Pose
+    {
+    float cx, cy; // where the drawing's origin lands on the panel
+    float c, s;   // cosine and sine of its clockwise turn, times its scale
+    float k;      // the scale alone (for radii and line widths)
+    };
+
+static Pose makePose(float cx, float cy, float clockwiseDeg, float scale)
+    {
+    const float a = clockwiseDeg * 0.01745329252f;
+    return { cx, cy, cosf(a) * scale, sinf(a) * scale, scale };
+    }
+
+// With y pointing down the panel, this is a clockwise turn as the eye sees it.
+static inline tgx::fVec2 place(const Pose& p, float x, float y)
+    {
+    return tgx::fVec2(p.cx + x * p.c - y * p.s, p.cy + x * p.s + y * p.c);
+    }
+
+static void poseLine(tgx::Image<tgx::RGB565>& im, const Pose& p, float x0, float y0,
+                     float x1, float y1, float width, tgx::RGB565 col)
+    {
+    im.drawThickLineAA(place(p, x0, y0), place(p, x1, y1), width,
+                       tgx::END_ROUNDED, tgx::END_ROUNDED, col);
+    }
+
+// A closed outline through n points (n <= 16).
+static void poseOutline(tgx::Image<tgx::RGB565>& im, const Pose& p, const float (*pts)[2],
+                        int n, float width, tgx::RGB565 col)
+    {
+    tgx::fVec2 out[16];
+    if (n > 16) n = 16;
+    for (int i = 0; i < n; i++) out[i] = place(p, pts[i][0], pts[i][1]);
+    // Drawn as n round-ended strokes rather than tgx's thick polygon: these
+    // outlines are not convex (a car is not), and round ends make clean
+    // joints at any angle.
+    for (int i = 0; i < n; i++)
+        im.drawThickLineAA(out[i], out[(i + 1) % n], width, tgx::END_ROUNDED, tgx::END_ROUNDED, col);
+    }
+
+// The E30 from behind: boxy shell, upright greenhouse, the two wide
+// tail-lamp clusters with the plate between them. 80 x 58 units.
+static void drawE30Rear(tgx::Image<tgx::RGB565>& im, const Pose& p, tgx::RGB565 col)
+    {
+    static const float shell[][2] =
+        {
+        { -23, -31 }, {  23, -31 },               // roof
+        {  31, -11 }, {  39,  -9 },               // C-pillar down to the shoulder
+        {  40,  12 }, {  37,  16 },               // flank, bumper corner
+        { -37,  16 }, { -40,  12 },
+        { -39,  -9 }, { -31, -11 },
+        };
+    static const float glass[][2]  = { { -19, -27 }, { 19, -27 }, { 25, -14 }, { -25, -14 } };
+    static const float lampL[][2]  = { { -36, -6 }, { -15, -6 }, { -15, 2 }, { -36, 2 } };
+    static const float lampR[][2]  = { {  15, -6 }, {  36, -6 }, {  36, 2 }, {  15, 2 } };
+
+    // Tires first, so the shell's bottom edge draws over their tops.
+    im.fillQuadAA(place(p, -38, 15), place(p, -27, 15), place(p, -27, 27), place(p, -38, 27), col);
+    im.fillQuadAA(place(p,  27, 15), place(p,  38, 15), place(p,  38, 27), place(p,  27, 27), col);
+
+    poseOutline(im, p, shell, 10, 2.6f, col);
+    poseOutline(im, p, glass, 4, 2.0f, col);
+    poseOutline(im, p, lampL, 4, 2.0f, col);
+    poseOutline(im, p, lampR, 4, 2.0f, col);
+    poseLine(im, p, -39, 8, 39, 8, 2.0f, col);     // bumper
+    poseLine(im, p, -8, -2, 8, -2, 2.0f, col);     // number plate
+    }
+
+// The E30 from the side, facing left: long bonnet, upright glass, short
+// boot, and the kink at the foot of the rear pillar. 154 x 54 units.
+static void drawE30Side(tgx::Image<tgx::RGB565>& im, const Pose& p, tgx::RGB565 col, tgx::RGB565 bg)
+    {
+    static const float shell[][2] =
+        {
+        { -76,   9 }, { -77,   1 }, { -75,  -7 },  // valance, bumper, leading edge of the bonnet
+        { -34, -12 },                              // bonnet -> foot of the windscreen
+        { -15, -31 }, {  27, -31 },                // roof
+        {  46, -13 },                              // rear screen -> boot lid
+        {  73, -12 }, {  77,  -4 }, {  76,   9 },  // boot, tail, rear bumper
+        };
+    static const float glass[][2] =
+        {
+        { -29, -14 }, { -14, -27 },                // windscreen pillar
+        {  24, -27 },                              // roof rail
+        {  37, -18 }, {  32, -14 },                // the Hofmeister kink
+        };
+
+    poseOutline(im, p, shell, 10, 2.6f, col);
+    poseOutline(im, p, glass, 5, 2.0f, col);
+    poseLine(im, p, 4, -27, 4, -14, 2.0f, col);    // B-pillar
+    poseLine(im, p, -72, 1, 72, 1, 1.6f, col);     // the rubbing strip, bumper to bumper
+
+    // Wheels: punch the arch out of the sill, then tire and hub.
+    static const float wheelX[2] = { -47.0f, 45.0f };
+    for (float wx : wheelX)
+        {
+        const tgx::fVec2 c = place(p, wx, 10);
+        im.fillCircleAA(c, 15.5f * p.k, bg);
+        im.drawThickCircleAA(c, 12.5f * p.k, 3.2f, col);
+        im.fillCircleAA(c, 3.0f * p.k, col);
+        }
+    }
+
+// Radial tick marks of a scale: from angle a0 to a1 in steps, around (cx, cy).
+// Angles are clockwise from "zeroDeg" (itself clockwise from 12 o'clock).
+static void drawScaleTicks(tgx::Image<tgx::RGB565>& im, float cx, float cy, float zeroDeg,
+                           int a0, int a1, int step, int majorEvery,
+                           float rInnerMinor, float rInnerMajor, float rOuter, tgx::RGB565 col)
+    {
+    for (int a = a0; a <= a1; a += step)
+        {
+        const float rad = (zeroDeg + a) * 0.01745329252f;
+        const float dx = sinf(rad), dy = -cosf(rad);
+        const bool  major = (a % majorEvery) == 0;
+        const float r0 = major ? rInnerMajor : rInnerMinor;
+        im.drawThickLineAA(tgx::fVec2(cx + dx * r0, cy + dy * r0),
+                           tgx::fVec2(cx + dx * rOuter, cy + dy * rOuter),
+                           major ? 2.6f : 1.8f, tgx::END_STRAIGHT, tgx::END_STRAIGHT, col);
+        }
+    }
+
+// The right-hand column every motion page shares: label, number, rule.
+static void drawMotionColumn(tgx::Image<tgx::RGB565>& im, const Theme& t, const char* label,
+                             const char* value, bool valid)
+    {
+    im.drawTextEx(label, {342, 2}, FONT_LABEL, tgx::Anchor::CENTERTOP, false, false, t.green);
+    im.drawTextEx(valid ? value : "--", {SCREEN_LX - 6, 40}, FONT_VALUE_SM, tgx::Anchor::TOPRIGHT,
+                  false, false, valid ? t.green : t.divider);
+    im.drawFastHLine({262, 98}, SCREEN_LX - 270, t.divider);
+    }
+
+// One line of text in the bottom-right box (where the banner goes on its
+// home panel). Nine characters fit.
+static void drawMotionNote(tgx::Image<tgx::RGB565>& im, const char* text, tgx::RGB565 col)
+    {
+    im.drawTextEx(text, {342, 120}, FONT_LABEL, tgx::Anchor::CENTER, false, false, col);
+    }
+
+// Angles are shown in whole degrees and the picture turns in half degrees:
+// below that the estimate's own noise would redraw the car every tick.
+static inline float halfDegrees(float deg) { return roundf(deg * 2.0f) * 0.5f; }
+
+static void renderRoll(tgx::Image<tgx::RGB565>& im, const Theme& t, bool live)
+    {
+    const ImuData& u = g_data.imu;
+    drawFrameBase(im, t);
+
+    const float cx = 128.0f, cy = 86.0f;
+    const float roll = live ? halfDegrees(u.rollDeg) : 0.0f;
+
+    // The fixed world: a scale over the roof (10-degree ticks to 60 each
+    // way) and a horizon stub either side of the car.
+    drawScaleTicks(im, cx, cy, 0.0f, -60, 60, 10, 30, 67.0f, 62.0f, 73.0f, t.divider);
+    im.drawThickLineAA({6, cy}, {56, cy}, 2.0f, tgx::END_STRAIGHT, tgx::END_STRAIGHT, t.divider);
+    im.drawThickLineAA({200, cy}, {250, cy}, 2.0f, tgx::END_STRAIGHT, tgx::END_STRAIGHT, t.divider);
+
+    // The car, and a pointer standing on its roof. Roll + = right side down
+    // = clockwise seen from behind.
+    const Pose p = makePose(cx, cy, roll, 1.2f);
+    const tgx::RGB565 col = live ? t.green : t.divider;
+    drawE30Rear(im, p, col);
+    im.drawThickLineAA(place(p, 0, -35), place(p, 0, -44), 3.0f, tgx::END_STRAIGHT, tgx::END_ARROW_2, col);
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.0f", fabsf(u.rollDeg) < 0.5f ? 0.0f : u.rollDeg);
+    drawMotionColumn(im, t, "ROLL \xB0", buf, live);
+    }
+
+static void renderPitch(tgx::Image<tgx::RGB565>& im, const Theme& t, bool live)
+    {
+    const ImuData& u = g_data.imu;
+    drawFrameBase(im, t);
+
+    const float cx = 142.0f, cy = 74.0f;
+    const float pitch = live ? halfDegrees(u.pitchDeg) : 0.0f;
+
+    // The scale stands ahead of the nose (the car faces left): 5-degree
+    // ticks to 30 each way, and a ground stub behind the tail.
+    drawScaleTicks(im, cx, cy, 270.0f, -30, 30, 5, 10, 115.0f, 111.0f, 121.0f, t.divider);
+    im.drawThickLineAA({236, cy}, {250, cy}, 2.0f, tgx::END_STRAIGHT, tgx::END_STRAIGHT, t.divider);
+
+    // Facing left, nose up is a clockwise turn - the same sense as the
+    // roll page, so both read the same way round.
+    const Pose p = makePose(cx, cy, pitch, 1.15f);
+    const tgx::RGB565 col = live ? t.green : t.divider;
+    drawE30Side(im, p, col, t.bg);
+    im.drawThickLineAA(place(p, -81, 0), place(p, -90, 0), 3.0f, tgx::END_STRAIGHT, tgx::END_ARROW_2, col);
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.0f", fabsf(u.pitchDeg) < 0.5f ? 0.0f : u.pitchDeg);
+    drawMotionColumn(im, t, "PITCH \xB0", buf, live);
+    }
+
+// Outer ring of the g-meter, in g. Rings are drawn at each third of it.
+static const float G_METER_FULL_G = 1.5f;
+
+static void renderGMeter(tgx::Image<tgx::RGB565>& im, const Theme& t, bool live)
+    {
+    const ImuData& u = g_data.imu;
+    drawFrameBase(im, t);
+
+    const float cx = 128.0f, cy = 71.0f, rFull = 63.0f;
+    const float pxPerG = rFull / G_METER_FULL_G;
+
+    for (int ring = 1; ring <= 3; ring++)
+        im.drawThickCircleAA({cx, cy}, rFull * ring / 3.0f, 1.6f, t.divider);
+    im.drawFastHLine({(int)(cx - rFull), (int)cy}, (int)(2 * rFull) + 1, t.divider);
+    im.drawFastVLine({(int)cx, (int)(cy - rFull)}, (int)(2 * rFull) + 1, t.divider);
+
+    if (live)
+        {
+        // The dot goes where a loose ball on the dash would roll: forward
+        // under braking, to the right in a left-hander. So it plots MINUS
+        // the acceleration - up the panel is "forward".
+        auto clampR = [&](float g) { return constrain(g, -G_METER_FULL_G, G_METER_FULL_G) * pxPerG; };
+
+        // The four maxima since the LEVEL SET detent was last visited.
+        const tgx::RGB565 mk = t.info;
+        im.drawThickLineAA({cx - 6, cy - clampR(u.maxBrakeG)}, {cx + 6, cy - clampR(u.maxBrakeG)}, 2.4f,
+                           tgx::END_STRAIGHT, tgx::END_STRAIGHT, mk);
+        im.drawThickLineAA({cx - 6, cy + clampR(u.maxAccelG)}, {cx + 6, cy + clampR(u.maxAccelG)}, 2.4f,
+                           tgx::END_STRAIGHT, tgx::END_STRAIGHT, mk);
+        im.drawThickLineAA({cx + clampR(u.maxLeftG), cy - 6}, {cx + clampR(u.maxLeftG), cy + 6}, 2.4f,
+                           tgx::END_STRAIGHT, tgx::END_STRAIGHT, mk);
+        im.drawThickLineAA({cx - clampR(u.maxRightG), cy - 6}, {cx - clampR(u.maxRightG), cy + 6}, 2.4f,
+                           tgx::END_STRAIGHT, tgx::END_STRAIGHT, mk);
+
+        // Whole pixels: a dot placed to a fraction of a pixel would redraw
+        // itself on sensor noise alone.
+        float dx = u.latG * pxPerG, dy = u.lonG * pxPerG;
+        const float r = sqrtf(dx * dx + dy * dy);
+        if (r > rFull) { dx *= rFull / r; dy *= rFull / r; } // pin it to the outer ring
+        im.fillCircleAA({roundf(cx + dx), roundf(cy + dy)}, 6.5f, t.green);
+        }
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.2f", sqrtf(u.lonG * u.lonG + u.latG * u.latG));
+    drawMotionColumn(im, t, "G", buf, live);
+    }
+
+void gaugeRenderMotion(uint16_t* fb, uint8_t page, bool bannerHome)
+    {
+    tgx::Image<tgx::RGB565> im(fb, SCREEN_LX, SCREEN_LY);
+    const Theme    t    = buildTheme();
+    const ImuData& u    = g_data.imu;
+    const bool     live = g_data.imuOnline();
+
+    switch (page)
+        {
+        default:
+        case 0: renderRoll  (im, t, live); break;
+        case 1: renderPitch (im, t, live); break;
+        case 2: renderGMeter(im, t, live); break;
+        }
+
+    // The bottom-right box. An active alarm always wins it on the banner's
+    // home panel - this mode must never hide a warning.
+    if (bannerHome && g_data.alarms.top != ALARM_NONE)
+        {
+        drawBanner(im, t);
+        return;
+        }
+
+    char note[16];
+    switch (page)
+        {
+        default:
+        case 0:
+            if (!live)            drawMotionNote(im, "NO IMU", t.divider);
+            else if (!u.levelCal) drawMotionNote(im, "NOT LEVEL", t.info); // a LEVEL SET is still owed
+            break;
+
+        case 1:
+            if (u.levelSetActive)
+                {
+                // The LEVEL SET gesture reports here.
+                if (u.levelSetDone)         drawMotionNote(im, "LEVEL SET", t.green);
+                else if (u.levelSetWaiting) drawMotionNote(im, live ? "HOLD STILL" : "NO IMU", t.info);
+                else
+                    {
+                    snprintf(note, sizeof(note), "HOLD %u%%", u.levelSetPct);
+                    drawMotionNote(im, note, t.info);
+                    }
+                }
+            else if (live && u.lastAirMs > 0)
+                {
+                snprintf(note, sizeof(note), "AIR %.2fS", u.lastAirMs / 1000.0f); // the last jump
+                drawMotionNote(im, note, t.green);
+                }
+            break;
+
+        case 2:
+            if (live)
+                {
+                snprintf(note, sizeof(note), "HIT %.1fG", u.maxPeakG); // hardest hit since the maxima were reset
+                drawMotionNote(im, note, t.green);
+                }
+            break;
         }
     }
 

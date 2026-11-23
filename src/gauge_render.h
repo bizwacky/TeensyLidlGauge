@@ -28,3 +28,9 @@ void gaugeRenderScreen(uint16_t* fb, ScreenContent content);
 
 // The MODE_DEBUG dense diagnostics layout, page 0..2 (one per display).
 void gaugeRenderDebug(uint16_t* fb, uint8_t page);
+
+// The MODE_INCLINOMETER / MODE_LEVEL_SET pages, 0..2 (one per display): the
+// E30 rolling, the E30 pitching, the g-meter. bannerHome = this display is
+// the one that normally carries the warning banner; an active alarm still
+// draws there.
+void gaugeRenderMotion(uint16_t* fb, uint8_t page, bool bannerHome);

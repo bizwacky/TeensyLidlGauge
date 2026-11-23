@@ -77,6 +77,7 @@ other's frames, so the ECU's base address is moved to **0x680 (1664)**; see
 | 0x4C0, 0x4C1 | the gauge (roof switches + pots for the PDMs, placeholder ids) |
 | 0x5E8-0x5EC | rusEFI MS Simplified Broadcast |
 | 0x680-0x68B | rusEFI native broadcast (moved from 0x200) |
+| 0x6A0-0x6A3 | the gauge (IMU: g, attitude, jumps, impacts; see `IMU_SETUP.md`). Placed above everything that matters so it loses every arbitration |
 
 Before adding anything to the bus, check its ids against this table.
 

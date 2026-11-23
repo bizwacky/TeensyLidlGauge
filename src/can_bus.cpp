@@ -27,6 +27,9 @@
 // Those two are the car's light switches - their layout is at the bottom of
 // this file and in docs/PDM_CAN_SETUP.md, and it is a contract with each
 // PDM's dingoConfig setup: change one side, change the other.
+// The four IMU frames (also canBusTick20ms) are for whoever wants to log
+// them - today a Lua script on the ECU (docs/rusefi_imu.lua); layout below
+// the switch frames and in docs/IMU_SETUP.md.
 // ---------------------------------------------------------------------------
 
 #include "can_bus.h"
@@ -427,6 +430,10 @@ void canBusInit()
                   (unsigned long)PDM_BASE_ID[PDM_E], (unsigned long)PDM_BASE_ID[PDM_L],
                   (unsigned long)GAUGE_ID_SWITCHES, (unsigned long)GAUGE_ID_POTS,
                   (unsigned long)GAUGE_TX_PERIOD_MS);
+    Serial.printf("      IMU frames 0x%03lX-0x%03lX (impact + motion every %lu ms, attitude %lu ms, event %lu ms)\n",
+                  (unsigned long)IMU_CAN_BASE_ID, (unsigned long)IMU_CAN_ID_EVENT,
+                  (unsigned long)IMU_CAN_FAST_MS, (unsigned long)IMU_CAN_ATTITUDE_MS,
+                  (unsigned long)IMU_CAN_EVENT_MS);
     }
 
 void canBusPoll()
@@ -502,6 +509,128 @@ static void buildPotFrame(uint8_t* b)
         b[5 + i] = g_data.fans.dutyPct[i];
     }
 
+// --- the gauge's own frames: the IMU --------------------------------------------------
+// Four 8-byte frames, little-endian, on ids chosen to lose every arbitration
+// that matters (config.h, IMU_CAN_BASE_ID). Signs and axes as in
+// vehicle_data.h: lon + = speeding up, lat + = turning left, vert + = up
+// (1 g at rest); roll + = right side down, pitch + = nose up, yaw + = left.
+//
+// IMU_CAN_ID_IMPACT, every IMU_CAN_FAST_MS - the high-g channel, PEAK-HELD:
+//   bytes 0-1  uint16  largest total acceleration of the last 0.2 s   0.01 g
+//   bytes 2-3  int16   lon  \  per axis: the reading of largest size  0.01 g
+//   bytes 4-5  int16   lat   } in the same 0.2 s, with its sign
+//   bytes 6-7  int16   vert /
+//   Held so that a logger sampling slower than the hit is long still sees
+//   it at full height. At rest: 1.00, 0, 0, +1.00. All zero = no IMU data.
+//
+// IMU_CAN_ID_MOTION, every IMU_CAN_FAST_MS - the low-g channel, smoothed:
+//   bytes 0-1  int16   lon                                            0.001 g
+//   bytes 2-3  int16   lat                                            0.001 g
+//   bytes 4-5  int16   vert                                           0.001 g
+//   bytes 6-7  int16   yaw rate                                       0.1 deg/s
+//
+// IMU_CAN_ID_ATTITUDE, every IMU_CAN_ATTITUDE_MS:
+//   bytes 0-1  int16   roll                                           0.1 deg
+//   bytes 2-3  int16   pitch                                          0.1 deg
+//   bytes 4-5  uint16  air time of the last jump                      1 ms
+//   byte  6    uint8   jumps since boot (wraps)
+//   byte  7    status  bit 0 IMU data is live     bit 1 level-calibrated
+//                      bit 2 high-g trim settled  bit 3 airborne now
+//                      bit 4 an impact capture is recording
+//                      bit 5 standing still       bit 6 samples have been lost
+//                                                       since boot (FIFO overrun)
+//
+// IMU_CAN_ID_EVENT, every IMU_CAN_EVENT_MS - the latest impact capture:
+//   bytes 0-1  uint16  capture number (0 = none yet); it steps when a
+//                      capture starts, and the black box carries the same
+//                      number                                         1
+//   bytes 2-3  uint16  its peak total acceleration                    0.01 g
+//   bytes 4-5  uint16  its delta-v, all three axes combined           0.01 m/s
+//   bytes 6-7  uint16  landing of the last jump, total acceleration   0.01 g
+
+static inline void put16(uint8_t* b, int32_t v)
+    {
+    b[0] = (uint8_t)(v & 0xFF);
+    b[1] = (uint8_t)((v >> 8) & 0xFF);
+    }
+static inline int32_t scaledS16(float v, float perUnit) // signed, saturating
+    {
+    return (int32_t)lroundf(constrain(v * perUnit, -32767.0f, 32767.0f));
+    }
+static inline int32_t scaledU16(float v, float perUnit) // unsigned, saturating
+    {
+    return (int32_t)lroundf(constrain(v * perUnit, 0.0f, 65535.0f));
+    }
+
+static_assert(IMU_CAN_FAST_MS % TICK_FAST_MS == 0 && IMU_CAN_ATTITUDE_MS % TICK_FAST_MS == 0
+              && IMU_CAN_EVENT_MS % TICK_FAST_MS == 0,
+              "the IMU frame periods must be multiples of the 20 ms tick");
+static_assert(IMU_CAN_FAST_MS >= 2 * TICK_FAST_MS,
+              "the impact and motion frames share a period and go out on alternate ticks");
+
+static void sendImuFrames()
+    {
+    static uint32_t s_tick; // counts 20 ms ticks. The frames take turns: at
+    s_tick++;               //  the default periods no tick sends more than two
+
+    const ImuData& imu     = g_data.imu;
+    const uint32_t fastN   = IMU_CAN_FAST_MS / TICK_FAST_MS;
+    const uint32_t attN    = IMU_CAN_ATTITUDE_MS / TICK_FAST_MS;
+    const uint32_t eventN  = IMU_CAN_EVENT_MS / TICK_FAST_MS;
+
+    CAN_message_t msg;
+    msg.len = 8;
+
+    if (s_tick % fastN == 0)
+        {
+        msg.id = IMU_CAN_ID_IMPACT;
+        put16(msg.buf + 0, scaledU16(imu.peakG,     100.0f));
+        put16(msg.buf + 2, scaledS16(imu.peakLonG,  100.0f));
+        put16(msg.buf + 4, scaledS16(imu.peakLatG,  100.0f));
+        put16(msg.buf + 6, scaledS16(imu.peakVertG, 100.0f));
+        s_can.write(msg);
+        }
+    else if (s_tick % fastN == 1)
+        {
+        msg.id = IMU_CAN_ID_MOTION;
+        put16(msg.buf + 0, scaledS16(imu.lonG,       1000.0f));
+        put16(msg.buf + 2, scaledS16(imu.latG,       1000.0f));
+        put16(msg.buf + 4, scaledS16(imu.vertG,      1000.0f));
+        put16(msg.buf + 6, scaledS16(imu.yawRateDps, 10.0f));
+        s_can.write(msg);
+        }
+
+    if (s_tick % attN == attN / 2)
+        {
+        msg.id = IMU_CAN_ID_ATTITUDE;
+        put16(msg.buf + 0, scaledS16(imu.rollDeg,  10.0f));
+        put16(msg.buf + 2, scaledS16(imu.pitchDeg, 10.0f));
+        put16(msg.buf + 4, imu.lastAirMs);
+        msg.buf[6] = (uint8_t)imu.jumpCount;
+        msg.buf[7] = (uint8_t)((g_data.imuOnline()  ? 0x01 : 0)
+                             | (imu.levelCal        ? 0x02 : 0)
+                             | (imu.hgTrimmed       ? 0x04 : 0)
+                             | (imu.airborne        ? 0x08 : 0)
+                             | (imu.event.active    ? 0x10 : 0)
+                             | (imu.still           ? 0x20 : 0)
+                             | (imu.fifoOverruns    ? 0x40 : 0));
+        s_can.write(msg);
+        }
+
+    if (s_tick % eventN == eventN / 2)
+        {
+        const ImuEventData& e = imu.event;
+        const float dv = sqrtf(e.dvLonMps * e.dvLonMps + e.dvLatMps * e.dvLatMps
+                               + e.dvVertMps * e.dvVertMps);
+        msg.id = IMU_CAN_ID_EVENT;
+        put16(msg.buf + 0, (int32_t)(e.id & 0xFFFF));
+        put16(msg.buf + 2, scaledU16(e.peakG,       100.0f));
+        put16(msg.buf + 4, scaledU16(dv,            100.0f));
+        put16(msg.buf + 6, scaledU16(imu.lastLandG, 100.0f));
+        s_can.write(msg);
+        }
+    }
+
 void canBusTick20ms()
     {
     static uint8_t  s_lastSwitch[8], s_lastPot[8];
@@ -539,6 +668,8 @@ void canBusTick20ms()
         }
 
     s_sentOnce = true;
+
+    sendImuFrames(); // after the switch frames: those are the ones that matter
     }
 
 void canBusTick1s()

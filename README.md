@@ -12,6 +12,8 @@ fed by CAN data from the rusEFI ECU (a Super uaEFI), the JK BMS and the
 car's two planned dingoFW PDMs. The gauge also reads the roof switch panel (six
 switches, five pots) and sends it to the PDMs over CAN - it is the car's
 light-switch node - and drives three PWM speed signals for the cabin fans.
+Its ±320 g IMU puts g, roll, pitch, jumps and impacts on the bus for the
+ECU's log, and keeps the hardest hits in its own memory.
 
 This repository holds the firmware (`src/`, `lib/`, `docs/`) and, in
 [`hardware/`](hardware/), the KiCad project, fab outputs and the 3D-printed
@@ -34,10 +36,11 @@ lives outside this repository.
   `--`. Stale data raises no alarms of its own.
 - The rotary dial is the only control: bright,
 - medium, dark (night colours turn every blue element amber, which is kinder
-  to dark-adapted eyes), debug, silent, fuel fill and displays off.
+  to dark-adapted eyes), debug, silent, fuel fill, displays off,
+  inclinometer and level set.
 - All vehicle I/O comes through one sealed 26-pin Superseal. The 12 V front end has reverse-polarity protection, a
   36 V TVS, a switching 5 V module and a separate 3.3 V LDO. The fuel
-  record (in CRC'd rotating slots) and a black-box log live in F-RAM, a hardware watchdog resets hung
+  record (in CRC'd rotating slots), a black-box log and the impact captures live in F-RAM, a hardware watchdog resets hung
   firmware within a second. 
 
 ## Hardware
@@ -161,10 +164,11 @@ given in each footprint's 3D model settings (most are under `Parts/`).
   from rusEFI's MS Simplified broadcast, the JK BMS Deye protocol (1 Hz)
   and both PDMs' dingoFW status frames (10 Hz, driven by the `PDM_FRAMES`
   table in `config.h`) - all little-endian. It transmits the 1 Hz PCS
-  heartbeat the BMS expects from an "inverter" and the two frames that
+  heartbeat the BMS expects from an "inverter", the two frames that
   carry the roof switches and pots to the PDMs (10 Hz + on change; every
   switch is sent as an on bit and an off bit so the PDM config can make
-  lamps fail ON). Every frame is counted as decoded, ignored (expected
+  lamps fail ON), and four IMU frames on ids that lose arbitration to
+  everything else. Every frame is counted as decoded, ignored (expected
   traffic we don't use) or unknown, so a misconfigured bus shows up as
   `unk=`.
 - `src/pdm.h/.cpp` - what the PDM status means: a verdict per output (OK /
@@ -196,16 +200,36 @@ given in each footprint's 3D model settings (most are under `Parts/`).
   bus), blocking reads for boot/console, shared CRC-16.
 - `src/fram_log.h/.cpp` - what the FRAM stores: the persistent fuel record
   (16 rotating CRC'd slots - kill-switch-proof) and the black-box flight
-  recorder (~1.8 h circular log of every gauge field, PDM temperatures and
-  output events, roof switches + active alarms), plus
-  the serial console (`h` in the monitor: CSV dump, fuel slots, format).
+  recorder (~74 min circular log of every gauge field, PDM temperatures and
+  output events, roof switches, g + active alarms), plus
+  the serial console (`h` in the monitor: CSV dump, fuel slots, impact
+  captures, format).
   **See `docs/FRAM_BLACKBOX.md`** for the memory map, record formats,
   wiring, and how to read the log out.
+- `src/fram_events.h/.cpp` - the impact captures: five seconds of high-g
+  waveform around each hard hit, in eight 4 KB slots at the top of the FRAM,
+  written while the hit happens so a capture survives the kill switch. The
+  two hardest hits are never overwritten.
+- `src/imu.h/.cpp` - the LSM6DSV320X driver: the chip samples into its own
+  FIFO (high-g at 960 Hz, low-g and gyro at 120 Hz) and the driver drains it
+  every few milliseconds over its own I2C bus, without blocking. Register
+  facts and their sources at the top of the .cpp.
+- `src/motion.h/.cpp` - what the IMU's samples mean: sensor axes to vehicle
+  axes (a fixed map plus the LEVEL SET gesture), roll and pitch (gyro
+  integrated, accelerometer corrected), the g-meter, the high-g channel
+  trimmed against the low-g one and peak-held for the log, jumps, and the
+  impact trigger with its ring of recent waveform. **See
+  `docs/IMU_SETUP.md`**: conventions, CAN frames, the bench checks that have
+  to pass before any of it is believed.
+- `src/imu_codec.h` - the one-byte encoding of an acceleration used in the
+  FRAM (square-root companded).
 - `src/gauge_render.h/.cpp` - what the three panels show: the bench-tested
   prototype layouts (big value left, secondary stack right), the semantic
   color Theme (night mode = every blue element turns amber, resolved in one
   place), per-readout coloring from alarm verdicts, the warning banner with
-  its 1 Hz critical flash, and the MODE_DEBUG dense pages. Stateless: every
+  its 1 Hz critical flash, the MODE_DEBUG dense pages, and the inclinometer
+  pages (an E30 rolling and pitching, first-gen 4Runner clinometer style,
+  and a g-meter). Stateless: every
   frame is composed from scratch from g_data ("compose then show", like the
   LED strip). Design story at the top of the .cpp.
 - `src/screens.h/.cpp` - how frames reach the glass: three ILI9341_T4
@@ -233,6 +257,15 @@ given in each footprint's 3D model settings (most are under `Parts/`).
   expects**: Base IDs, the status frames decoded (including the proposed
   frames for outputs 9-14), the two frames the gauge sends, the CAN-input
   recipe that makes lamps fail on, and the bench checks.
+- `docs/IMU_SETUP.md` - the IMU: sign conventions, the axis map and LEVEL
+  SET, the four CAN frames, the inclinometer pages, impact captures, the
+  debug line and the bench checklist.
+- `docs/rusefi_imu.lua` - the rusEFI Lua script that records the IMU frames
+  in the ECU's SD card log (eight Lua gauges).
+- `test/host/` - PC-side tests of the IMU code (`./run.sh`): the real
+  motion, capture-store, black-box and rendering sources built with g++
+  against synthetic sensor data and a RAM model of the FRAM. Not part of the
+  firmware build.
 - `lib/ILI9341_T4/` - vindar's ILI9341_T4 DMA display library, modified for
   the NV3007 controller. **Read `lib/ILI9341_T4/PORTING_NV3007.md`** for a
   walkthrough of every change and why it was needed. It is vendored from

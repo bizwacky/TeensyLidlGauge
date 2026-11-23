@@ -111,3 +111,11 @@ const char* pdmName(uint8_t box)
     static const char* const names[PDM_COUNT] = { "PDME", "PDML" };
     return (box < PDM_COUNT) ? names[box] : "PDM?";
     }
+
+// --- the IMU ----------------------------------------------------------------------
+
+bool VehicleData::imuOnline() const
+    {
+    if (!imu.present || imu.lastDataMs == 0) return false;
+    return (millis() - imu.lastDataMs) <= IMU_FRESH_MS;
+    }

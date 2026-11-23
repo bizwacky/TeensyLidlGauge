@@ -10,7 +10,8 @@
 //    CAN interrupt -> ring buffer -> canBusPoll() ---+
 //    ADC + switch pins -> inputsPoll() (20 ms tick) -+--> g_data (raw+derived:
 //    RTC + die temp -/                                |    PDM verdicts, mixture
-//                                                     |    window, fuel calc)
+//    IMU FIFO -> imuPump() -> motion.cpp ------------+    window, fuel calc,
+//                                                     |    attitude + g)
 //                                                     alarmsUpdate()
 //                                                           v
 //                                                    g_data.alarms --> audio,
@@ -35,11 +36,13 @@
 // display DMA transfers overlap everything else.
 //
 //   every pass : drain the CAN queue, pump DFPlayer notifications, pump the
-//                FRAM write queue + serial console (all cheap when idle)
-//   20 ms tick : poll inputs, PDM verdicts, resolve the dial, mixture window,
-//                fuel calc, fan PWM, alarm state machine, switch/pot frames
-//                to the PDMs, LED tach frame, screens 1-3 (draw + diff +
-//                DMA), backlight PWM, feed the watchdog
+//                FRAM write queue + serial console, drain the IMU's FIFO
+//                (all cheap when idle)
+//   20 ms tick : poll inputs, PDM verdicts, resolve the dial, motion (g,
+//                attitude, LEVEL SET), mixture window, fuel calc, fan PWM,
+//                alarm state machine, switch/pot + IMU frames onto CAN,
+//                impact capture -> FRAM, LED tach frame, screens 1-3 (draw +
+//                diff + DMA), backlight PWM, feed the watchdog
 //   1 s tick   : PCS heartbeat, audio arbitration, FRAM fuel record +
 //                black-box log record, debug snapshot
 //
@@ -68,6 +71,9 @@
 #include "watchdog.h"
 #include "fram.h"
 #include "fram_log.h"
+#include "fram_events.h"
+#include "imu.h"
+#include "motion.h"
 
 // --- 1 Hz debug snapshot ---------------------------------------------------------
 // The whole g_data struct, one section per line. This is the bring-up and
@@ -226,6 +232,35 @@ static void debugPrint()
     else
         Serial.printf("[FRAM] MISSING (persistence + black box disabled)\n");
 
+    // The IMU. First line: the car's motion (smooth values from the low-g
+    // channel, then the peak-held high-g channel). Second line: the chip's
+    // health - rate should read ~960, fifo well under 256, and bus/ovr/tag
+    // should all sit at 0 (docs/IMU_SETUP.md says what each one means).
+    ImuData& u = g_data.imu;
+    if (!u.present)
+        Serial.printf("[IMU ] MISSING (no motion data; retrying)\n");
+    else
+        {
+        Serial.printf("[IMU ] %s lon=%+.2f lat=%+.2f vert=%+.2fg roll=%+.1f pitch=%+.1fdeg yaw=%+.1fdps%s%s | "
+                      "peak %.2fg (%+.2f %+.2f %+.2f) max %.1fg\n",
+                      g_data.imuOnline() ? "OK   " : "STALE",
+                      u.lonG, u.latG, u.vertG, u.rollDeg, u.pitchDeg, u.yawRateDps,
+                      u.still ? " still" : "", u.airborne ? " AIRBORNE" : "",
+                      u.peakG, u.peakLonG, u.peakLatG, u.peakVertG, u.maxPeakG);
+        Serial.printf("       rate=%.0fHz fifo=%u bus=%lu ovr=%lu tag=%lu | level=%s hgTrim=%+.2f/%+.2f/%+.2fg%s | "
+                      "jumps=%u last %ums/%.1fg | impact #%lu %.1fg%s\n",
+                      u.hgRateHz, u.fifoPeakWords, (unsigned long)u.busErrors,
+                      (unsigned long)u.fifoOverruns, (unsigned long)u.tagErrors,
+                      u.levelCal ? "set" : "NOT SET",
+                      u.hgOffsetG[0], u.hgOffsetG[1], u.hgOffsetG[2], u.hgTrimmed ? "" : " (settling)",
+                      u.jumpCount, u.lastAirMs, u.lastLandG,
+                      (unsigned long)u.event.id, u.event.peakG, u.event.active ? " RECORDING" : "");
+        if (u.levelSetActive)
+            Serial.printf("       LEVEL SET: %s\n", u.levelSetDone ? "done"
+                          : u.levelSetWaiting ? "waiting for the car to be still" : "hold still...");
+        }
+    u.fifoPeakWords = 0; // "deepest since the last print"
+
     const AlarmsData& a = g_data.alarms;
     static const char* colorNames[] = { "GRN", "BLU", "YEL", "RED" };
     if (a.top == ALARM_NONE)
@@ -258,6 +293,8 @@ void setup()
     framInit();    // bring up the I2C bus, probe the chip
     framLogInit(); // verify/format the layout, recover the log head
     fuelCalcInit();// restores the FRAM fuel record - must follow framLogInit
+    imuInit();     // bring up the IMU's own I2C bus, configure the chip
+    motionInit();  // restores the level calibration - must follow framLogInit
     alarmsInit();
     audioInit();
     ledTachInit();
@@ -281,6 +318,7 @@ void loop()
     audioLoop();
     framPump();    // start the next queued FRAM write if the bus is idle
     framLogPoll(); // serial console + (if one is running) the chunked CSV dump
+    imuPump();     // drain the IMU's FIFO -> motion.cpp (g, attitude, impacts)
 
     // 20 ms tick. elapsedMillis is a Teensy type that counts up on its own;
     // subtracting the period (rather than resetting to 0) means no drift:
@@ -295,11 +333,14 @@ void loop()
         inputsPoll();     // fuel, rotary, roof switches, pots, temp, clock -> g_data
         pdmUpdate();      // PDM status -> per-output verdicts + lamp states
         modesUpdate();    // dial position (+ lamps) -> resolved mode flags (g_data.mode)
+        motionUpdate();   // IMU samples so far -> g_data.imu; the LEVEL SET gesture
         mixtureUpdate();  // gated two-second lambda window -> g_data.ecu
         fuelCalcUpdate(); // burn integration + FUEL FILL gesture -> g_data.fuel
         fansUpdate();     // pots -> cabin fan PWM duty
         alarmsUpdate();   // evaluate the whole warning catalog -> g_data.alarms
-        canBusTick20ms(); // roof switches + pots -> the PDMs (on change / 10 Hz)
+        canBusTick20ms(); // roof switches + pots -> the PDMs (on change / 10 Hz);
+                          // the IMU frames, each at its own period
+        framEventsTick(); // an impact capture in progress -> the FRAM, block by block
         ledTachUpdate();  // paint the strip from this tick's verdicts (50 Hz)
         screensUpdate();  // compose + diff + DMA-push all three panels
         backlightUpdate();// fade screen backlights toward the mode's level
@@ -318,6 +359,7 @@ void loop()
         audioTick1s();   // pick + start at most one voice callout
         framLogTick1s(); // fuel record (if changed) + black-box record (if
                          // this second is worth remembering) -> write queue
+        imuTick1s();     // measured IMU sample rate, for the line below
         debugPrint();
         }
     }

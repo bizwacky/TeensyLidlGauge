@@ -20,7 +20,9 @@
 //   0x00020  fuel ring    16 x 32 B  slot = seq % 16
 //   0x00220  log head ptr  2 x 16 B  slot = seq % 2 - "where does the log
 //                                    resume?", updated after every record
-//   0x00400  black box    3251 x 40 B circular, to the end of the chip
+//   0x00240  IMU level cal 2 x 32 B  slot = seq % 2 - the LEVEL SET result
+//   0x00400  black box    2210 x 44 B circular, up to the capture slots
+//   0x18000  impact captures 8 x 4096 B  (fram_events.cpp owns these)
 //
 // WHY A HEAD POINTER RECORD AT ALL: the ring's write position must survive
 // reboots or every boot would restart at index 0 and chew up the oldest
@@ -35,7 +37,7 @@
 // link alarms excluded: a gauge powered with the car off would otherwise
 // log "NO CAN" in a loop until the ring's real content was gone). Cadence
 // is every LOG_NOMINAL_EVERY_S normally, every LOG_ALARM_EVERY_S while an
-// alarm is up - the boring laps stretch the ring to ~1.8 h, the spicy parts
+// alarm is up - the boring laps stretch the ring to ~74 min, the spicy parts
 // get full resolution. After the trigger clears, logging runs LOG_GRACE_MS
 // longer: the 30 s AFTER a stall or alarm is exactly the evidence a black
 // box exists to keep.
@@ -56,6 +58,9 @@
 #include "alarms.h"    // alarmColor()/alarmName() for gating + CSV decode
 #include "pdm.h"       // pdmDeviceFresh()/pdmVerdictName() for the PDM columns
 #include "fuel_calc.h" // fuelCalcGetState() - the accumulators to persist
+#include "motion.h"    // motionLogTake() - g since the previous record
+#include "imu_codec.h" // the one-byte encoding of the peak
+#include "fram_events.h" // the impact captures share the chip and the console
 
 // --- record formats ---------------------------------------------------------------
 // All little-endian (the Teensy's native order), packed so the in-memory
@@ -77,7 +82,12 @@ static const uint32_t FRAM_MAGIC          = ((uint32_t)'G' << 24) | ((uint32_t)'
 // current, the last PDM output event (which load, what happened, how many
 // amps) and the roof switch states. Ring capacity fell from 4064 records
 // to 3251.
-static const uint16_t FRAM_LAYOUT_VERSION = 4;
+// v5 (Nov 2026): the IMU. Each record gained four bytes (average lon/lat g,
+// the hardest hit since the previous record, the latest impact capture's
+// number) and the top 32 KB of the chip became the impact capture slots, so
+// the ring holds 2210 records of 44 bytes. The level calibration got its own
+// two slots in the bookkeeping area.
+static const uint16_t FRAM_LAYOUT_VERSION = 5;
 
 struct __attribute__((packed)) FramHeader          // 32 B at 0x0000
     {
@@ -113,9 +123,29 @@ struct __attribute__((packed)) LogPtrRecord        // 16 B x 2 slots at 0x0220
     };
 static_assert(sizeof(LogPtrRecord) == 16, "log pointer must be exactly 16 bytes");
 
+struct __attribute__((packed)) ImuCalRecord        // 32 B x 2 slots at 0x0240
+    {
+    uint32_t seq;      // newest valid slot wins
+    float    up[3];    // the direction of "up" measured by the LEVEL SET, in
+                       // the gauge's nominal axes (motion.cpp turns it into
+                       // the rotation that levels the readings)
+    uint8_t  pad[14];
+    uint16_t crc;
+    };
+static_assert(sizeof(ImuCalRecord) == 32, "IMU calibration record must be exactly 32 bytes");
+static_assert(FRAM_ADDR_IMUCAL >= FRAM_ADDR_LOGPTR + 2 * sizeof(LogPtrRecord)
+              && FRAM_ADDR_IMUCAL + 2 * sizeof(ImuCalRecord) <= FRAM_ADDR_LOG,
+              "the IMU calibration slots must fit between the log pointer and the ring");
+
 static const uint8_t LOG_ALARM_BYTES = 5; // 40 bits of alarm mask
 
-struct __attribute__((packed)) LogRecord           // 40 B, the black box entry
+// The peak-g byte is square-root companded over this range whatever full
+// scale the sensor is set to, so the format does not move with a config
+// change. 0.14 g steps at 1 g, 0.4 g at 10 g, 1.4 g at 100 g.
+static const float  LOG_PEAK_FULL_SCALE_G = 320.0f;
+static const int8_t LOG_G_NONE            = -128; // gLon50/gLat50: no IMU data
+
+struct __attribute__((packed)) LogRecord           // 44 B, the black box entry
     {
     uint32_t seq;          // monotonic forever (never resets except format)
     uint8_t  session;      // which run this belongs to - splits the CSV
@@ -149,16 +179,26 @@ struct __attribute__((packed)) LogRecord           // 40 B, the black box entry
     uint8_t  roofBits;     // roof switches, bit 0 = SW1 on ... bit 5 = SW6 on
     uint8_t  alarmBits[LOG_ALARM_BYTES]; // bit n = AlarmId n active this
                                          // second (byte n/8, bit n%8)
+    int8_t   gLon50;       // AVERAGE longitudinal g since the previous record,
+                           // x 50 (0.02 g steps, +-2.5 g), + = speeding up.
+                           // LOG_G_NONE = no IMU data in the interval
+    int8_t   gLat50;       // average lateral g x 50, + = turning left. Next to
+                           // the oil pressure byte this is the oil-surge
+                           // detector: pressure sagging in long corners
+    uint8_t  gPeak;        // hardest hit since the previous record (total
+                           // acceleration), companded over LOG_PEAK_FULL_SCALE_G
+    uint8_t  impactId;     // low byte of the latest impact capture's number
+                           // (0 = none yet): finds the capture for this second
     uint16_t crc;
     };
-static_assert(sizeof(LogRecord) == 40, "log record must be exactly 40 bytes");
+static_assert(sizeof(LogRecord) == 44, "log record must be exactly 44 bytes");
 static_assert(sizeof(LogRecord) <= FRAM_MAX_WRITE, "the FRAM write queue must hold a whole log record");
 static_assert(ALARM_COUNT <= LOG_ALARM_BYTES * 8, "alarmBits holds one bit per alarm - widen it before adding more");
 static_assert(PDM_COUNT == 2 && PDM_MAX_OUTPUTS <= 16, "pdmEvent packs the box into 1 bit and the output into 4");
 
-// Ring capacity: every 40-byte slot that fits between the bookkeeping area
-// and the end of the chip. (131072 - 1024) / 40 = 3251 records.
-static const uint32_t LOG_CAPACITY = (FRAM_SIZE_BYTES - FRAM_ADDR_LOG) / sizeof(LogRecord);
+// Ring capacity: every 44-byte slot that fits between the bookkeeping area
+// and the impact capture slots. (98304 - 1024) / 44 = 2210 records.
+static const uint32_t LOG_CAPACITY = (FRAM_ADDR_EVENTS - FRAM_ADDR_LOG) / sizeof(LogRecord);
 
 // --- module state -----------------------------------------------------------------
 
@@ -167,6 +207,7 @@ static uint32_t s_logSeq  = 1;         // seq for the NEXT log record
 static uint32_t s_logIdx;              // ring index for the NEXT log record
 static uint8_t  s_session = 1;         // this boot's run number
 static uint32_t s_fuelSeq = 1;         // seq for the NEXT fuel record
+static uint32_t s_imuCalSeq = 1;       // seq for the NEXT IMU calibration record
 
 // Change detection for the fuel save: NAN never compares equal to anything,
 // so the very first valid state always saves.
@@ -181,20 +222,13 @@ static uint8_t  s_ticksSinceRec = 255; // big, so the first worthy tick logs imm
 static uint32_t logSlotAddr(uint32_t idx)  { return FRAM_ADDR_LOG + idx * sizeof(LogRecord); }
 static uint32_t fuelSlotAddr(uint32_t seq) { return FRAM_ADDR_FUEL + (seq % FRAM_FUEL_SLOTS) * sizeof(FuelRecord); }
 static uint32_t ptrSlotAddr(uint32_t seq)  { return FRAM_ADDR_LOGPTR + (seq % 2) * sizeof(LogPtrRecord); }
+static uint32_t calSlotAddr(uint32_t seq)  { return FRAM_ADDR_IMUCAL + (seq % 2) * sizeof(ImuCalRecord); }
 
 // Enqueue + pump until it's on the chip. Boot/console use only - the 1 s
 // tick never calls this (it fires and forgets via framWriteAsync).
 static bool writeSync(uint32_t addr, const void* src, uint8_t len)
     {
-    if (!framWriteAsync(addr, src, len))
-        return false;
-    elapsedMillis guard;
-    while (!framIdle())
-        {
-        framPump();
-        if (guard > 50) return false;
-        }
-    return true;
+    return framWriteSync(addr, src, len);
     }
 
 // Scaled-integer encoders. Everything clamps: a sensor spiking outside its
@@ -295,6 +329,54 @@ static void fuelSaveTick()
     g_data.fram.fuelSaves++;
     }
 
+// --- IMU level calibration --------------------------------------------------------
+// Two ping-pong slots, the log pointer's scheme: a save always lands in the
+// slot the previous save did not use, and a load takes the newest slot whose
+// CRC and contents pass.
+
+bool framImuCalLoad(float up[3])
+    {
+    if (!s_mounted)
+        return false;
+
+    bool found = false;
+    ImuCalRecord best = {};
+    for (uint8_t slot = 0; slot < 2; slot++)
+        {
+        ImuCalRecord rec;
+        if (!framRead(FRAM_ADDR_IMUCAL + slot * sizeof(ImuCalRecord), &rec, sizeof(rec)))
+            continue;
+        if (rec.seq == 0 || framCrc16(&rec, sizeof(rec) - 2) != rec.crc) continue;
+        // A direction, so its length must be 1 - anything else is not ours.
+        const float len2 = rec.up[0] * rec.up[0] + rec.up[1] * rec.up[1] + rec.up[2] * rec.up[2];
+        if (!isfinite(len2) || len2 < 0.9f || len2 > 1.1f) continue;
+        if (!found || rec.seq > best.seq) { best = rec; found = true; }
+        }
+    if (!found)
+        return false;
+
+    s_imuCalSeq = best.seq + 1;
+    up[0] = best.up[0];
+    up[1] = best.up[1];
+    up[2] = best.up[2];
+    return true;
+    }
+
+void framImuCalSave(const float up[3])
+    {
+    if (!g_data.fram.present || !s_mounted)
+        return; // no chip: the calibration lasts until the next power cycle
+
+    ImuCalRecord rec = {};
+    rec.seq   = s_imuCalSeq;
+    rec.up[0] = up[0];
+    rec.up[1] = up[1];
+    rec.up[2] = up[2];
+    rec.crc   = framCrc16(&rec, sizeof(rec) - 2);
+    if (framWriteAsync(calSlotAddr(s_imuCalSeq), &rec, sizeof(rec)))
+        s_imuCalSeq++;
+    }
+
 // --- the black box ----------------------------------------------------------------
 
 static bool s_dumpSuspendsLog; // console dump in progress - hold new records
@@ -307,7 +389,13 @@ static void blackBoxTick()
     const bool inWindow = (int32_t)(millis() - s_worthyUntilMs) < 0;
     g_data.fram.logging = inWindow && !s_dumpSuspendsLog;
     if (!g_data.fram.logging)
+        {
+        // The g fields mean "since the previous record". While nothing is
+        // being recorded, keep emptying the accumulators so the first record
+        // of the next run does not carry a door slammed an hour ago.
+        motionLogTake();
         return;
+        }
 
     // Cadence: full rate while an alarm is up, relaxed when nominal.
     const uint8_t everyN = spicyAlarmActive() ? LOG_ALARM_EVERY_S : LOG_NOMINAL_EVERY_S;
@@ -362,10 +450,17 @@ static void blackBoxTick()
     for (uint8_t i = 0; i < ALARM_COUNT; i++)
         if (g_data.alarms.active[i])
             rec.alarmBits[i / 8] |= (uint8_t)(1u << (i % 8));
+    const MotionLogSample g = motionLogTake(); // everything since the previous record
+    rec.gLon50   = g.valid ? (int8_t)lroundf(constrain(g.lonMeanG * 50.0f, -127.0f, 127.0f)) : LOG_G_NONE;
+    rec.gLat50   = g.valid ? (int8_t)lroundf(constrain(g.latMeanG * 50.0f, -127.0f, 127.0f)) : LOG_G_NONE;
+    rec.gPeak    = g.valid ? imuCompandU(g.peakG, LOG_PEAK_FULL_SCALE_G) : 0;
+    rec.impactId = (uint8_t)g_data.imu.event.id;
     rec.crc = framCrc16(&rec, sizeof(rec) - 2);
 
     if (!framWriteAsync(logSlotAddr(s_logIdx), &rec, sizeof(rec)))
-        return; // queue full (shouldn't happen) - retry next tick
+        return; // queue full (shouldn't happen) - retry next tick. (The g
+                // interval was consumed above: that retry's g fields cover
+                // one second less. Accepted.)
 
     ev.pending = false; // the event went into the queue with this record
     s_logSeq++;
@@ -389,7 +484,7 @@ static void blackBoxTick()
 
 static void formatChip(uint32_t formatCount)
     {
-    Serial.println("FRAM: formatting (header + fuel slots + log pointer)...");
+    Serial.println("FRAM: formatting (header, fuel slots, log pointer, IMU level calibration, impact captures)...");
 
     FramHeader h  = {};
     h.magic        = FRAM_MAGIC;
@@ -416,10 +511,18 @@ static void formatChip(uint32_t formatCount)
     writeSync(ptrSlotAddr(0), &ptr, sizeof(ptr)); // seq 0 -> slot 0
     writeSync(ptrSlotAddr(1), &ptr, sizeof(ptr)); // both slots start valid
 
+    // The IMU's level calibration and the impact captures go with the rest:
+    // after a format the chip holds nothing from before.
+    const uint8_t noCal[sizeof(ImuCalRecord)] = {};
+    for (uint8_t slot = 0; slot < 2; slot++)
+        writeSync(FRAM_ADDR_IMUCAL + slot * sizeof(ImuCalRecord), noCal, sizeof(noCal));
+    framEventsFormat();
+
     s_logSeq  = 1;
     s_logIdx  = 0;
     s_session = 1;
     s_fuelSeq = 1;
+    s_imuCalSeq = 1;
     s_lastSavedRemaining = NAN; // force the next valid fuel state to save
     s_lastSavedBurned    = NAN;
     g_data.fram.logRecords = 0;
@@ -488,6 +591,7 @@ void framLogInit()
                       (unsigned long)LOG_CAPACITY, s_session);
         }
     g_data.fram.mounted = true;
+    framEventsMount(); // what the impact capture slots hold, and the next capture id
     }
 
 void framLogTick1s()
@@ -501,7 +605,7 @@ void framLogTick1s()
 // --- serial console + chunked CSV dump --------------------------------------------
 // The dump runs as a state machine pumped from framLogPoll(), a few records
 // per superloop pass, so the 20 ms tick (and the watchdog feed inside it)
-// never waits on 4000 I2C reads. Two phases:
+// never waits on 2000 I2C reads. Two phases:
 //
 //   COUNTING: walk BACKWARD from the head while records are intact and the
 //     sequence numbers run contiguously - that finds where readable history
@@ -577,7 +681,7 @@ static void dumpPump()
             Serial.println("seq,session,time,ecu_err,rpm,oil_psi,oil_C,clt_C,map_kPa,tps,"
                            "lambda,lambda_tgt,batt_V,inj_duty,fuel_sender,fuel_calc,"
                            "pack_A,cell_min_V,batt_C,pdme_C,pdml_C,pdme_A,pdml_A,"
-                           "pdm_event,event_A,roof_sw,alarm_hex,alarms");
+                           "pdm_event,event_A,roof_sw,g_lon,g_lat,g_peak,impact,alarm_hex,alarms");
             s_dumpPhase = DUMP_PRINTING;
             s_dumpStep  = 0;
             if (s_dumpCount == 0) dumpStop("done (no contiguous history)");
@@ -639,8 +743,21 @@ static void dumpPump()
             snprintf(eventA, sizeof(eventA), "%u", r.pdmEventAmps);
             }
 
+        // IMU columns: average lon/lat g over the record's interval (empty
+        // when the IMU sent nothing), the hardest hit in it, and the number
+        // (low byte) of the latest impact capture - 'e' on the console lists
+        // those.
+        char gLon[8] = "", gLat[8] = "", gPeak[8] = "", impact[6] = "";
+        if (r.gLon50 != LOG_G_NONE)
+            {
+            snprintf(gLon,  sizeof(gLon),  "%.2f", r.gLon50 / 50.0f);
+            snprintf(gLat,  sizeof(gLat),  "%.2f", r.gLat50 / 50.0f);
+            snprintf(gPeak, sizeof(gPeak), "%.1f", imuExpandU(r.gPeak, LOG_PEAK_FULL_SCALE_G));
+            }
+        if (r.impactId) snprintf(impact, sizeof(impact), "%u", r.impactId);
+
         Serial.printf("%lu,%u,%s,%u,%u,%u,%d,%d,%u,%u,%.2f,%.2f,%.1f,%u,%u,%u,%d,%.2f,%d,"
-                      "%s,%s,%s,%s,%s,%s,%02X,%02X%02X%02X%02X%02X,%s\n",
+                      "%s,%s,%s,%s,%s,%s,%02X,%s,%s,%s,%s,%02X%02X%02X%02X%02X,%s\n",
                       (unsigned long)r.seq, r.session, clock, r.ecuLastError, r.rpm,
                       r.oilPressPsi, (int)r.oilTempC40 - 40, (int)r.cltC40 - 40,
                       r.mapKpa, r.tpsPct,
@@ -649,7 +766,7 @@ static void dumpPump()
                       (int)r.packAmps, 1.0f + r.cellMin100 / 100.0f,
                       (int)r.battMaxC40 - 40,
                       pdmT[PDM_E], pdmT[PDM_L], pdmA[PDM_E], pdmA[PDM_L],
-                      event, eventA, r.roofBits,
+                      event, eventA, r.roofBits, gLon, gLat, gPeak, impact,
                       r.alarmBits[4], r.alarmBits[3], r.alarmBits[2],
                       r.alarmBits[1], r.alarmBits[0], names);
         s_dumpStep++;
@@ -678,13 +795,15 @@ static void printFuelSlots()
 static void printHelp()
     {
     Serial.println("FRAM console:  l = dump black box as CSV   f = show fuel slots");
-    Serial.println("               X then Y = FORMAT (erases fuel record + log)   q = abort dump");
+    framEventsConsoleHelp();
+    Serial.println("               X then Y = FORMAT (erases everything on the chip)   q = abort dump");
     }
 
 void framLogPoll()
     {
     if (s_dumpPhase != DUMP_IDLE)
         dumpPump();
+    framEventsDumpPump(); // the impact-capture dump, chunked the same way
 
     while (Serial.available())
         {
@@ -696,9 +815,23 @@ void framLogPoll()
             dumpStop("ABORTED");
             continue;
             }
+        if (framEventsDumping())
+            {
+            framEventsDumpAbort("ABORTED");
+            continue;
+            }
         if (!g_data.fram.present || !s_mounted)
             {
             Serial.println("FRAM: not available");
+            continue;
+            }
+
+        // 'Y' confirms whichever of the two destructive commands is armed.
+        if (c == 'Y' && framEventsConfirmClear())
+            continue;
+        if (framEventsConsoleKey(c)) // e / E / C: the impact captures
+            {
+            s_formatArmedMs = 0;
             continue;
             }
 
@@ -708,6 +841,7 @@ void framLogPoll()
             case 'f': case 'F': printFuelSlots(); break;
             case 'X':
                 s_formatArmedMs = millis();
+                framEventsDisarmClear();
                 Serial.println("FORMAT ARMED: send 'Y' within 5 s to erase the FRAM");
                 break;
             case 'Y':
